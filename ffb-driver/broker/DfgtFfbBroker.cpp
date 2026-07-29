@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdint>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -22,6 +23,7 @@
 namespace {
 
 constexpr DWORD kReadTimeoutMs = 350;
+constexpr DWORD kHidWriteTimeoutMs = 75;
 constexpr std::uint32_t kRangeLockEngageLow = 256;
 constexpr std::uint32_t kRangeLockReleaseLow = 1024;
 constexpr std::uint32_t kRangeLockEngageHigh = 16127;
@@ -41,7 +43,7 @@ public:
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             nullptr,
             OPEN_EXISTING,
-            0,
+            FILE_FLAG_OVERLAPPED,
             nullptr);
         if (handle_ == INVALID_HANDLE_VALUE) return HRESULT_FROM_WIN32(GetLastError());
 
@@ -61,7 +63,7 @@ public:
         readEvent_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
         if (readEvent_ == nullptr) {
             const auto result = HRESULT_FROM_WIN32(GetLastError());
-            Close();
+            CloseHandlesOnly();
             return result;
         }
         readHandle_ = CreateFileW(
@@ -74,12 +76,12 @@ public:
             nullptr);
         if (readHandle_ == INVALID_HANDLE_VALUE) {
             const auto result = HRESULT_FROM_WIN32(GetLastError());
-            Close();
+            CloseHandlesOnly();
             return result;
         }
         if (!HidD_GetPreparsedData(readHandle_, &preparsedData_)) {
             const auto result = HRESULT_FROM_WIN32(GetLastError());
-            Close();
+            CloseHandlesOnly();
             return result;
         }
         HIDP_CAPS capabilities{};
@@ -87,16 +89,21 @@ public:
                 HIDP_STATUS_SUCCESS ||
             capabilities.InputReportByteLength == 0 ||
             capabilities.InputReportByteLength > readBuffer_.size()) {
-            Close();
+            CloseHandlesOnly();
             return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
         }
         inputReportBytes_ = capabilities.InputReportByteLength;
         const auto readResult = BeginRead();
         if (FAILED(readResult)) {
-            Close();
+            CloseHandlesOnly();
             return readResult;
         }
-        return StopAll();
+        const auto neutralResult = StopAll();
+        if (FAILED(neutralResult)) {
+            CloseHandlesOnly();
+            return neutralResult;
+        }
+        return S_OK;
     }
 
     HRESULT Constant(
@@ -265,6 +272,14 @@ public:
             StopAll();
             Send(dfgt::reports::Range(900));
         }
+        CloseHandlesOnly();
+        rangeDegrees_ = 900;
+        baseConstant_ = 0;
+        rangeLockState_ = 0;
+    }
+
+private:
+    void CloseHandlesOnly() noexcept {
         if (readHandle_ != INVALID_HANDLE_VALUE) {
             CancelIoEx(readHandle_, &readOverlapped_);
             CloseHandle(readHandle_);
@@ -280,14 +295,14 @@ public:
             readEvent_ = nullptr;
         }
         if (handle_ != INVALID_HANDLE_VALUE) {
+            CancelIoEx(handle_, nullptr);
             CloseHandle(handle_);
             handle_ = INVALID_HANDLE_VALUE;
         }
-        rangeDegrees_ = 900;
-        baseConstant_ = 0;
-        rangeLockState_ = 0;
+        inputReportBytes_ = 0;
     }
 
+public:
     HRESULT ApplyProfile(
         const dfgt::ipc::control::Profile& profile) noexcept {
         if (profile.id[dfgt::ipc::control::ProfileIdCharacters - 1] != L'\0' ||
@@ -380,24 +395,60 @@ private:
     }
 
     HRESULT Send(const std::array<std::uint8_t, 8>& report) noexcept {
-        if (handle_ == INVALID_HANDLE_VALUE) return HRESULT_FROM_WIN32(ERROR_DEVICE_NOT_CONNECTED);
-        if (HidD_SetOutputReport(
-                handle_,
-                const_cast<std::uint8_t*>(report.data()),
-                static_cast<ULONG>(report.size()))) {
-            return S_OK;
+        if (handle_ == INVALID_HANDLE_VALUE) {
+            return HRESULT_FROM_WIN32(ERROR_DEVICE_NOT_CONNECTED);
         }
+        struct PendingWrite final {
+            OVERLAPPED overlapped{};
+            std::array<std::uint8_t, 8> bytes{};
+            HANDLE event{nullptr};
+            ~PendingWrite() {
+                if (event != nullptr) CloseHandle(event);
+            }
+        };
+        auto pending = std::make_unique<PendingWrite>();
+        pending->bytes = report;
+        const auto event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (event == nullptr) return HRESULT_FROM_WIN32(GetLastError());
+        pending->event = event;
+        pending->overlapped.hEvent = event;
         DWORD written = 0;
-        if (WriteFile(
+        const auto completed = WriteFile(
                 handle_,
-                report.data(),
-                static_cast<DWORD>(report.size()),
+                pending->bytes.data(),
+                static_cast<DWORD>(pending->bytes.size()),
                 &written,
-                nullptr) &&
-            written == report.size()) {
-            return S_OK;
+                &pending->overlapped);
+        if (!completed) {
+            const auto error = GetLastError();
+            if (error != ERROR_IO_PENDING) {
+                return HRESULT_FROM_WIN32(error);
+            }
+            const auto wait = WaitForSingleObject(
+                event, kHidWriteTimeoutMs);
+            if (wait != WAIT_OBJECT_0) {
+                CancelIoEx(handle_, &pending->overlapped);
+                if (WaitForSingleObject(
+                        event, kHidWriteTimeoutMs) != WAIT_OBJECT_0) {
+                    // Preserve the OVERLAPPED and buffer if a broken driver
+                    // ignores cancellation. The broker remains responsive;
+                    // process teardown reclaims this quarantined allocation.
+                    pending.release();
+                }
+                return wait == WAIT_TIMEOUT
+                    ? HRESULT_FROM_WIN32(ERROR_TIMEOUT)
+                    : HRESULT_FROM_WIN32(GetLastError());
+            }
+            if (!GetOverlappedResult(
+                    handle_, &pending->overlapped, &written, FALSE)) {
+                const auto result =
+                    HRESULT_FROM_WIN32(GetLastError());
+                return result;
+            }
         }
-        return HRESULT_FROM_WIN32(GetLastError());
+        return written == report.size()
+            ? S_OK
+            : HRESULT_FROM_WIN32(ERROR_WRITE_FAULT);
     }
 
     HANDLE handle_{INVALID_HANDLE_VALUE};
