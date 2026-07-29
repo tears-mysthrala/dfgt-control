@@ -12,12 +12,14 @@
 #include <mutex>
 #include <new>
 #include <numbers>
+#include <system_error>
 #include <thread>
 #include <unordered_map>
 #include <vector>
 
 #include "../shared/BrokerProtocol.h"
 #include "../shared/BoundedIo.h"
+#include "../shared/EffectTiming.h"
 
 // {806A045D-E7E8-491E-A607-31495A7BF4A3}
 static constexpr GUID CLSID_DfgtDirectInputFfb{
@@ -481,7 +483,7 @@ public:
         DWORD effectId,
         DWORD* handle,
         const DIEFFECT* effect,
-        DWORD flags) override {
+        DWORD flags) override try {
         if (!Matches(externalId) || handle == nullptr || effect == nullptr) return E_INVALIDARG;
         LogDiagnostic(
             "DownloadEffect externalId=%lu effectId=%lu flags=%lu handle=%lu",
@@ -529,6 +531,15 @@ public:
             return RenderEverythingLocked(std::chrono::steady_clock::now());
         }
         return S_OK;
+    } catch (const std::bad_alloc&) {
+        return E_OUTOFMEMORY;
+    } catch (const std::system_error& error) {
+        const auto value = error.code().value();
+        return value > 0
+            ? HRESULT_FROM_WIN32(static_cast<DWORD>(value))
+            : E_FAIL;
+    } catch (...) {
+        return E_FAIL;
     }
 
     HRESULT STDMETHODCALLTYPE DestroyEffect(DWORD externalId, DWORD handle) override {
@@ -555,10 +566,19 @@ public:
             static_cast<unsigned long>(mode),
             static_cast<unsigned long>(iterations));
         if (!Matches(externalId)) return E_INVALIDARG;
+        if ((mode & ~DIES_SOLO) != 0) return DIERR_INVALIDPARAM;
         std::scoped_lock lock(stateMutex_);
         const auto found = effects_.find(handle);
         if (found == effects_.end()) return DIERR_NOTDOWNLOADED;
-        if (iterations == 0) return E_INVALIDARG;
+        if (iterations == 0) return DIERR_INVALIDPARAM;
+        if ((mode & DIES_SOLO) != 0) {
+            for (auto& [otherHandle, effect] : effects_) {
+                if (otherHandle == handle) continue;
+                effect.playing = false;
+                effect.hasDeadline = false;
+                effect.conditionStarted = false;
+            }
+        }
         found->second.playing = true;
         ArmDeadline(found->second, iterations);
         timerWake_.notify_all();
@@ -598,7 +618,7 @@ private:
     static HRESULT ParseEffect(
         DWORD effectId,
         const DIEFFECT& source,
-        EffectState& target) noexcept {
+        EffectState& target) {
         if (source.dwSize < sizeof(DIEFFECT) ||
             source.dwGain > 10000 ||
             source.lpvTypeSpecificParams == nullptr ||
@@ -950,16 +970,10 @@ private:
         effect.startsAt = std::chrono::steady_clock::now() +
             std::chrono::microseconds(effect.startDelayUs);
         effect.conditionStarted = false;
-        effect.hasDeadline = effect.durationUs != INFINITE;
-        if (!effect.hasDeadline) return;
-        const auto boundedIterations = iterations == INFINITE
-            ? static_cast<std::uint64_t>(UINT32_MAX)
-            : static_cast<std::uint64_t>(iterations);
-        const auto totalUs = std::min<std::uint64_t>(
-            static_cast<std::uint64_t>(effect.durationUs) * boundedIterations,
-            static_cast<std::uint64_t>(std::chrono::microseconds::max().count()));
-        effect.deadline = effect.startsAt +
-            std::chrono::microseconds(totalUs);
+        const auto deadline = dfgt::timing::Deadline(
+            effect.startsAt, effect.durationUs, iterations);
+        effect.hasDeadline = deadline.has_value();
+        if (deadline) effect.deadline = *deadline;
     }
 
     void TimerLoop(std::stop_token stop) noexcept {

@@ -35,6 +35,9 @@ target_link_options(DfgtFfbComSmoke PRIVATE /guard:cf /DYNAMICBASE /NXCOMPAT)
 target_link_libraries(DfgtFfbComSmoke PRIVATE dxguid)
 set_target_properties(DfgtFfbComSmoke PROPERTIES
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+add_test(
+    NAME com-abi-activation
+    COMMAND DfgtFfbComSmoke $<TARGET_FILE:DfgtDirectInputFfb>)
 
 add_executable(DfgtFfbBroker broker/DfgtFfbBroker.cpp)
 target_compile_features(DfgtFfbBroker PRIVATE cxx_std_20)
@@ -150,6 +153,18 @@ target_link_options(DfgtEmergencyIoGateTests PRIVATE
 set_target_properties(DfgtEmergencyIoGateTests PROPERTIES
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 add_test(NAME emergency-io-gate COMMAND DfgtEmergencyIoGateTests)
+
+add_executable(DfgtEffectTimingTests tests/EffectTimingTests.cpp)
+target_compile_features(DfgtEffectTimingTests PRIVATE cxx_std_20)
+target_compile_definitions(DfgtEffectTimingTests PRIVATE
+    WIN32_LEAN_AND_MEAN NOMINMAX)
+target_compile_options(DfgtEffectTimingTests PRIVATE
+    /W4 /WX /permissive- /guard:cf)
+target_link_options(DfgtEffectTimingTests PRIVATE
+    /guard:cf /DYNAMICBASE /NXCOMPAT)
+set_target_properties(DfgtEffectTimingTests PROPERTIES
+    MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+add_test(NAME effect-timing COMMAND DfgtEffectTimingTests)
 
 add_executable(DfgtBrokerRangeSmoke tests/BrokerRangeSmoke.cpp)
 target_compile_features(DfgtBrokerRangeSmoke PRIVATE cxx_std_20)
