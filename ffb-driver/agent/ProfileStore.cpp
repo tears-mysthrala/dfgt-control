@@ -128,15 +128,28 @@ bool WriteUtf8Atomically(
         return false;
     }
 
-    const auto temporary = path + L".tmp";
-    const auto file = CreateFileW(
-        temporary.c_str(),
-        GENERIC_WRITE,
-        0,
-        nullptr,
-        CREATE_ALWAYS,
-        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH,
-        nullptr);
+    std::wstring temporary;
+    HANDLE file = INVALID_HANDLE_VALUE;
+    for (unsigned attempt = 0;
+         attempt < 32 && file == INVALID_HANDLE_VALUE;
+         ++attempt) {
+        temporary = path + L"." +
+            std::to_wstring(GetCurrentProcessId()) + L"." +
+            std::to_wstring(GetTickCount64()) + L"." +
+            std::to_wstring(attempt) + L".tmp";
+        file = CreateFileW(
+            temporary.c_str(),
+            GENERIC_WRITE,
+            0,
+            nullptr,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH,
+            nullptr);
+        if (file == INVALID_HANDLE_VALUE &&
+            GetLastError() != ERROR_FILE_EXISTS) {
+            return false;
+        }
+    }
     if (file == INVALID_HANDLE_VALUE) return false;
     DWORD written = 0;
     const auto wrote = WriteFile(
@@ -151,11 +164,21 @@ bool WriteUtf8Atomically(
         DeleteFileW(temporary.c_str());
         return false;
     }
-    if (!MoveFileExW(
-            temporary.c_str(),
-            path.c_str(),
-            MOVEFILE_REPLACE_EXISTING |
-                MOVEFILE_WRITE_THROUGH)) {
+    const auto exists =
+        GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES;
+    const auto replaced = exists
+        ? ReplaceFileW(
+              path.c_str(),
+              temporary.c_str(),
+              (path + L".last-good").c_str(),
+              REPLACEFILE_WRITE_THROUGH,
+              nullptr,
+              nullptr)
+        : MoveFileExW(
+              temporary.c_str(),
+              path.c_str(),
+              MOVEFILE_WRITE_THROUGH);
+    if (!replaced) {
         DeleteFileW(temporary.c_str());
         return false;
     }
@@ -195,6 +218,9 @@ ProfileStore::ProfileStore() {
     std::filesystem::create_directories(directory, error);
     if (!error) path_ = directory + L"\\profiles.json";
 }
+
+ProfileStore::ProfileStore(std::wstring path)
+    : path_(std::move(path)) {}
 
 ProfileLoadResult ProfileStore::Load(
     std::vector<ProfileModel>& profiles) {

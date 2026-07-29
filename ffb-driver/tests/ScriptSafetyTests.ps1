@@ -62,5 +62,10 @@ if ($verify -notmatch "'incomplete'" -or
     $verify -notmatch 'notTested') {
     throw 'Verifier can no longer represent unknown evidence explicitly.'
 }
+if ($verify -notmatch 'DfgtFfbComSmoke\.exe' -or
+    $verify -notmatch 'activation\.tested' -or
+    $verify -notmatch 'activation\.passed') {
+    throw 'Verifier does not execute the packaged no-force COM smoke tests.'
+}
 
 Write-Output 'script safety invariants passed'

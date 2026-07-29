@@ -107,6 +107,27 @@ $comChecks = @(
         else { $null }
         $exists = $registeredPath -and
             (Test-Path -LiteralPath $registeredPath -PathType Leaf)
+        $smokePath = if ($registeredPath) {
+            Join-Path (Split-Path -Parent $registeredPath) `
+                'DfgtFfbComSmoke.exe'
+        }
+        else { $null }
+        $activation = if ($exists -and
+            (Test-Path -LiteralPath $smokePath -PathType Leaf)) {
+            & $smokePath $registeredPath 2>&1 | Out-String
+            [ordered]@{
+                tested = $true
+                exitCode = $LASTEXITCODE
+                passed = $LASTEXITCODE -eq 0
+            }
+        }
+        else {
+            [ordered]@{
+                tested = $false
+                exitCode = $null
+                passed = $false
+            }
+        }
         [ordered]@{
             architecture = $item.architecture
             registryPath = $item.path
@@ -114,6 +135,7 @@ $comChecks = @(
             exists = [bool]$exists
             ownedByManifest = [bool]($exists -and $manifest -and
                 @($manifest.files.path) -contains $registeredPath)
+            activation = $activation
         }
     }
 )
@@ -163,13 +185,10 @@ $requiredPassed = $hvciRegistry -eq 1 -and
     -not ($serviceChecks | Where-Object running) -and
     -not ($providerChecks | Where-Object { -not $_.matches }) -and
     -not ($comChecks | Where-Object {
-        -not $_.exists -or -not $_.ownedByManifest }) -and
+        -not $_.exists -or -not $_.ownedByManifest -or
+        -not $_.activation.tested -or -not $_.activation.passed }) -and
     -not ($filterChecks | Where-Object legacyFilterPresent)
-$notTested = @(
-    'DirectInput COM activation x64'
-    'DirectInput COM activation x86'
-    'Broker safety state and neutral confirmation'
-)
+$notTested = @('Broker safety state and neutral confirmation')
 $verdict = if (-not $requiredPassed) { 'fail' }
     elseif ($notTested.Count -gt 0) { 'incomplete' }
     else { 'pass' }

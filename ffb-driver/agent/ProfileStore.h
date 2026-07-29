@@ -28,6 +28,7 @@ struct ProfileModel {
 class ProfileStore final {
 public:
     ProfileStore();
+    explicit ProfileStore(std::wstring path);
 
     ProfileLoadResult Load(std::vector<ProfileModel>& profiles);
     bool Save(const std::vector<ProfileModel>& profiles);

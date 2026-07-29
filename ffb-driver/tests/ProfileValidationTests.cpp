@@ -1,6 +1,9 @@
 #include "../agent/ProfileStore.h"
 
+#include <windows.h>
+
 #include <iostream>
+#include <filesystem>
 #include <vector>
 
 namespace {
@@ -69,6 +72,40 @@ int wmain() {
     ok &= Expect(
         !ProfileStore::ValidateDocument(invalidGain),
         "out-of-range gain accepted");
+
+    const auto testRoot = std::filesystem::temp_directory_path() /
+        (std::wstring(L"DfgtProfileValidation-") +
+         std::to_wstring(GetCurrentProcessId()) + L"-" +
+         std::to_wstring(GetTickCount64()));
+    std::filesystem::create_directories(testRoot);
+    const auto profilePath = testRoot / L"profiles.json";
+    {
+        ProfileStore store(profilePath.wstring());
+        ok &= Expect(store.Save(valid), "initial atomic save failed");
+        valid[1].hardware.overallGain = 7500;
+        ok &= Expect(store.Save(valid), "replacement atomic save failed");
+        ok &= Expect(
+            std::filesystem::exists(profilePath.wstring() + L".last-good"),
+            "last-good backup was not retained");
+        for (const auto& entry :
+             std::filesystem::directory_iterator(testRoot)) {
+            ok &= Expect(
+                entry.path().extension() != L".tmp",
+                "owned temporary profile file leaked");
+        }
+        std::vector<dfgt::agent::ProfileModel> loaded;
+        ok &= Expect(
+            store.Load(loaded) ==
+                dfgt::agent::ProfileLoadResult::Loaded,
+            "saved profile document could not be loaded");
+        ok &= Expect(
+            loaded.size() == valid.size() &&
+                loaded[1].hardware.overallGain == 7500,
+            "saved profile content did not round trip");
+    }
+    std::error_code cleanupError;
+    std::filesystem::remove_all(testRoot, cleanupError);
+    ok &= Expect(!cleanupError, "profile test cleanup failed");
 
     return ok ? 0 : 1;
 }

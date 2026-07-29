@@ -48,6 +48,12 @@ $provider64 = Resolve-Artifact @(
 $provider32 = Resolve-Artifact @(
     'bin\x86\DfgtDirectInputFfb.dll',
     'build-x86\Release\DfgtDirectInputFfb.dll')
+$smoke64 = Resolve-Artifact @(
+    'bin\x64\DfgtFfbComSmoke.exe',
+    'build-x64\Release\DfgtFfbComSmoke.exe')
+$smoke32 = Resolve-Artifact @(
+    'bin\x86\DfgtFfbComSmoke.exe',
+    'build-x86\Release\DfgtFfbComSmoke.exe')
 $broker = Resolve-Artifact @(
     'bin\x64\DfgtFfbBroker.exe',
     'build-x64\Release\DfgtFfbBroker.exe')
@@ -57,7 +63,9 @@ $agent = Resolve-Artifact @(
 $ui = Resolve-Artifact @(
     'bin\x64\DfgtControl.exe',
     'ui\publish\DfgtControl.exe')
-foreach ($artifact in @($provider64, $provider32, $broker, $agent, $ui)) {
+foreach ($artifact in @(
+    $provider64, $provider32, $smoke64, $smoke32,
+    $broker, $agent, $ui)) {
     if (-not (Test-Path -LiteralPath $artifact -PathType Leaf)) {
         throw "Required release artifact is missing: $artifact"
     }
@@ -129,6 +137,8 @@ $bin64 = Join-Path $InstallRoot 'bin\x64'
 $bin32 = Join-Path $InstallRoot 'bin\x86'
 $installedProvider64 = Join-Path $bin64 'DfgtDirectInputFfb.dll'
 $installedProvider32 = Join-Path $bin32 'DfgtDirectInputFfb.dll'
+$installedSmoke64 = Join-Path $bin64 'DfgtFfbComSmoke.exe'
+$installedSmoke32 = Join-Path $bin32 'DfgtFfbComSmoke.exe'
 $installedBroker = Join-Path $bin64 'DfgtFfbBroker.exe'
 $installedAgent = Join-Path $bin64 'DfgtAgent.exe'
 $installedUi = Join-Path $bin64 'DfgtControl.exe'
@@ -160,6 +170,10 @@ if ($PSCmdlet.ShouldProcess($InstallRoot, 'Install DFGT user-mode FFB stack and 
         -Destination (Join-Path $stageBin64 'DfgtDirectInputFfb.dll')
     Copy-Item -LiteralPath $provider32 `
         -Destination (Join-Path $stageBin32 'DfgtDirectInputFfb.dll')
+    Copy-Item -LiteralPath $smoke64 `
+        -Destination (Join-Path $stageBin64 'DfgtFfbComSmoke.exe')
+    Copy-Item -LiteralPath $smoke32 `
+        -Destination (Join-Path $stageBin32 'DfgtFfbComSmoke.exe')
     Copy-Item -LiteralPath $broker `
         -Destination (Join-Path $stageBin64 'DfgtFfbBroker.exe')
     Copy-Item -LiteralPath $agent `
@@ -307,6 +321,8 @@ if ($PSCmdlet.ShouldProcess($InstallRoot, 'Install DFGT user-mode FFB stack and 
         files = @(
             $installedProvider64,
             $installedProvider32,
+            $installedSmoke64,
+            $installedSmoke32,
             $installedBroker,
             $installedAgent,
             $installedUi

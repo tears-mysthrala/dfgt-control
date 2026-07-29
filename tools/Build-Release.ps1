@@ -87,6 +87,8 @@ $uiPublish = Join-Path $driver 'ui\publish'
 
 Copy-Item (Join-Path $release64 'DfgtDirectInputFfb.dll') `
     (Join-Path $stage 'bin\x64')
+Copy-Item (Join-Path $release64 'DfgtFfbComSmoke.exe') `
+    (Join-Path $stage 'bin\x64')
 Copy-Item (Join-Path $release64 'DfgtFfbBroker.exe') `
     (Join-Path $stage 'bin\x64')
 Copy-Item (Join-Path $release64 'DfgtAgent.exe') `
@@ -94,6 +96,8 @@ Copy-Item (Join-Path $release64 'DfgtAgent.exe') `
 Copy-Item (Join-Path $uiPublish 'DfgtControl.exe') `
     (Join-Path $stage 'bin\x64')
 Copy-Item (Join-Path $release86 'DfgtDirectInputFfb.dll') `
+    (Join-Path $stage 'bin\x86')
+Copy-Item (Join-Path $release86 'DfgtFfbComSmoke.exe') `
     (Join-Path $stage 'bin\x86')
 $publicScripts = @(
     'Backup-LogitechLegacyStack.ps1',
@@ -119,6 +123,7 @@ Copy-Item -LiteralPath @(
     (Join-Path $root 'docs\SAFETY-STATE-MACHINE.md'),
     (Join-Path $root 'docs\TEST-MATRIX.md'),
     (Join-Path $root 'docs\MIGRATION-ROLLBACK.md'),
+    (Join-Path $root 'docs\VALIDATION.md'),
     (Join-Path $root 'docs\FINAL-HARDENING-REPORT.md')
 ) -Destination (Join-Path $stage 'docs')
 
