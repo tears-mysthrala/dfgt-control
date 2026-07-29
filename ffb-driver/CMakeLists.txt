@@ -39,6 +39,24 @@ add_test(
     NAME com-abi-activation
     COMMAND DfgtFfbComSmoke $<TARGET_FILE:DfgtDirectInputFfb>)
 
+add_executable(DfgtDirectInputContractTests
+    tests/DirectInputContractTests.cpp)
+target_compile_features(DfgtDirectInputContractTests PRIVATE cxx_std_20)
+target_compile_definitions(DfgtDirectInputContractTests PRIVATE
+    UNICODE _UNICODE DIRECTINPUT_VERSION=0x0800
+    WIN32_LEAN_AND_MEAN NOMINMAX)
+target_compile_options(DfgtDirectInputContractTests PRIVATE
+    /W4 /WX /permissive- /guard:cf)
+target_link_options(DfgtDirectInputContractTests PRIVATE
+    /guard:cf /DYNAMICBASE /NXCOMPAT)
+target_link_libraries(DfgtDirectInputContractTests PRIVATE dxguid)
+set_target_properties(DfgtDirectInputContractTests PROPERTIES
+    MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+add_test(
+    NAME directinput-contract
+    COMMAND DfgtDirectInputContractTests
+        $<TARGET_FILE:DfgtDirectInputFfb>)
+
 add_executable(DfgtFfbBroker broker/DfgtFfbBroker.cpp)
 target_compile_features(DfgtFfbBroker PRIVATE cxx_std_20)
 target_compile_definitions(DfgtFfbBroker PRIVATE

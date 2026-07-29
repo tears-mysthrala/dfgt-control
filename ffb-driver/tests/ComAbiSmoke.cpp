@@ -86,6 +86,7 @@ int wmain(int argc, wchar_t** argv) {
             effect.dwFlags = DIEFF_OBJECTIDS | DIEFF_CARTESIAN;
             effect.dwDuration = 250000;
             effect.dwGain = 10000;
+            effect.dwTriggerButton = DIEB_NOTRIGGER;
             effect.cAxes = 1;
             effect.rgdwAxes = &axis;
             effect.rglDirection = &direction;

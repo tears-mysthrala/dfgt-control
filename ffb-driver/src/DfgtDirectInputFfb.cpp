@@ -48,6 +48,18 @@ constexpr std::size_t kMaximumEffects = 16;
 constexpr DWORD kFirmwareRevision = 0x1322;
 constexpr DWORD kDriverVersion = 0x00010000;
 constexpr DWORD kPipeIoTimeoutMs = 250;
+constexpr DWORD kMinimumEffectPeriodUs = 2000;
+constexpr DWORD kKnownDownloadFlags =
+    DIEP_DURATION | DIEP_SAMPLEPERIOD | DIEP_GAIN |
+    DIEP_TRIGGERBUTTON | DIEP_TRIGGERREPEATINTERVAL |
+    DIEP_AXES | DIEP_DIRECTION | DIEP_ENVELOPE |
+    DIEP_TYPESPECIFICPARAMS | DIEP_START |
+    DIEP_NORESTART | DIEP_NODOWNLOAD | DIEP_STARTDELAY;
+constexpr DWORD kEffectParameterFlags =
+    DIEP_DURATION | DIEP_SAMPLEPERIOD | DIEP_GAIN |
+    DIEP_TRIGGERBUTTON | DIEP_TRIGGERREPEATINTERVAL |
+    DIEP_AXES | DIEP_DIRECTION | DIEP_ENVELOPE |
+    DIEP_TYPESPECIFICPARAMS | DIEP_STARTDELAY;
 
 void LogDiagnostic(const char* format, ...) noexcept {
     wchar_t enabled[2]{};
@@ -484,15 +496,35 @@ public:
         DWORD* handle,
         const DIEFFECT* effect,
         DWORD flags) override try {
-        if (!Matches(externalId) || handle == nullptr || effect == nullptr) return E_INVALIDARG;
+        if (!Matches(externalId) || handle == nullptr || effect == nullptr) {
+            return E_INVALIDARG;
+        }
+        if ((flags & ~kKnownDownloadFlags) != 0 ||
+            ((flags & DIEP_START) != 0 &&
+             (flags & DIEP_NODOWNLOAD) != 0)) {
+            return DIERR_INVALIDPARAM;
+        }
         LogDiagnostic(
             "DownloadEffect externalId=%lu effectId=%lu flags=%lu handle=%lu",
             static_cast<unsigned long>(externalId),
             static_cast<unsigned long>(effectId),
             static_cast<unsigned long>(flags),
             static_cast<unsigned long>(*handle));
-        EffectState candidate{};
-        const auto parseResult = ParseEffect(effectId, *effect, candidate);
+        const auto validateOnly = (flags & DIEP_NODOWNLOAD) != 0;
+        const auto requested = flags & kEffectParameterFlags;
+        std::scoped_lock lock(stateMutex_);
+        const auto creating = *handle == kInvalidEffectHandle;
+        const auto existing = creating
+            ? effects_.end()
+            : effects_.find(*handle);
+        if (!creating && existing == effects_.end()) {
+            return DIERR_NOTDOWNLOADED;
+        }
+        EffectState candidate =
+            creating ? EffectState{} : existing->second;
+        const auto parseResult = ParseEffect(
+            effectId, *effect, candidate,
+            requested, creating || requested == 0);
         LogDiagnostic(
             "DownloadEffect parse=0x%08lX magnitude=%ld gain=%lu duration=%lu",
             static_cast<unsigned long>(parseResult),
@@ -500,27 +532,21 @@ public:
             static_cast<unsigned long>(candidate.gain),
             static_cast<unsigned long>(candidate.durationUs));
         if (FAILED(parseResult)) return parseResult;
-        if ((flags & DIEP_NODOWNLOAD) != 0) return S_OK;
-
-        std::scoped_lock lock(stateMutex_);
-        if (*handle == kInvalidEffectHandle) {
+        if (validateOnly) return S_OK;
+        DWORD committedHandle = *handle;
+        if (creating) {
             if (effects_.size() >= kMaximumEffects) return DIERR_DEVICEFULL;
             while (nextHandle_ == kInvalidEffectHandle ||
                    effects_.contains(nextHandle_)) {
                 ++nextHandle_;
             }
-            *handle = nextHandle_++;
-            effects_.emplace(*handle, EffectState{});
-        } else if (!effects_.contains(*handle)) {
-            return DIERR_NOTDOWNLOADED;
+            committedHandle = nextHandle_++;
+            effects_.emplace(committedHandle, candidate);
+            *handle = committedHandle;
+        } else {
+            existing->second = candidate;
         }
-        auto& stored = effects_.at(*handle);
-        candidate.playing = stored.playing;
-        candidate.hasDeadline = stored.hasDeadline;
-        candidate.startsAt = stored.startsAt;
-        candidate.deadline = stored.deadline;
-        candidate.conditionStarted = stored.conditionStarted;
-        stored = candidate;
+        auto& stored = effects_.at(committedHandle);
         if ((flags & DIEP_START) != 0) {
             stored.playing = true;
             ArmDeadline(stored, 1);
@@ -528,6 +554,13 @@ public:
             return RenderEverythingLocked(std::chrono::steady_clock::now());
         }
         if (stored.playing) {
+            if ((flags & DIEP_NORESTART) != 0) {
+                const auto now = std::chrono::steady_clock::now();
+                const auto software = RenderAllLocked(now);
+                return FAILED(software)
+                    ? software
+                    : RenderConditionsLocked(now);
+            }
             return RenderEverythingLocked(std::chrono::steady_clock::now());
         }
         return S_OK;
@@ -618,22 +651,75 @@ private:
     static HRESULT ParseEffect(
         DWORD effectId,
         const DIEFFECT& source,
-        EffectState& target) {
-        if (source.dwSize < sizeof(DIEFFECT) ||
-            source.dwGain > 10000 ||
-            source.lpvTypeSpecificParams == nullptr ||
-            source.cAxes != 1 ||
-            source.rgdwAxes == nullptr ||
-            source.rglDirection == nullptr ||
-            (source.dwFlags & DIEFF_CARTESIAN) == 0) {
+        EffectState& target,
+        DWORD requested,
+        bool full) {
+        if (source.dwSize < sizeof(DIEFFECT)) {
             return DIERR_INVALIDPARAM;
         }
 
-        target.gain = source.dwGain;
-        target.durationUs = source.dwDuration;
-        target.startDelayUs = source.dwStartDelay;
-        target.direction = source.rglDirection[0] < 0 ? -1 : 1;
-        if (source.lpEnvelope != nullptr) {
+        if (full || (requested & DIEP_GAIN) != 0) {
+            if (source.dwGain > 10000) return DIERR_INVALIDPARAM;
+            target.gain = source.dwGain;
+        }
+        if (full || (requested & DIEP_DURATION) != 0) {
+            target.durationUs = source.dwDuration;
+        }
+        if (full || (requested & DIEP_STARTDELAY) != 0) {
+            target.startDelayUs = source.dwStartDelay;
+        }
+        if (full || (requested & DIEP_SAMPLEPERIOD) != 0) {
+            if (source.dwSamplePeriod != 0 &&
+                source.dwSamplePeriod < kMinimumEffectPeriodUs) {
+                return DIERR_INVALIDPARAM;
+            }
+        }
+        if (full || (requested &
+                (DIEP_TRIGGERBUTTON |
+                 DIEP_TRIGGERREPEATINTERVAL)) != 0) {
+            if (source.dwTriggerButton != DIEB_NOTRIGGER ||
+                source.dwTriggerRepeatInterval != 0) {
+                return DIERR_UNSUPPORTED;
+            }
+        }
+        if (full || (requested & DIEP_AXES) != 0) {
+            if (source.cAxes != 1 || source.rgdwAxes == nullptr) {
+                return DIERR_INVALIDPARAM;
+            }
+            const auto objectMode =
+                source.dwFlags & (DIEFF_OBJECTIDS | DIEFF_OBJECTOFFSETS);
+            const auto coordinateMode =
+                source.dwFlags &
+                (DIEFF_CARTESIAN | DIEFF_POLAR | DIEFF_SPHERICAL);
+            if (coordinateMode != DIEFF_CARTESIAN ||
+                (objectMode != DIEFF_OBJECTIDS &&
+                 objectMode != DIEFF_OBJECTOFFSETS)) {
+                return DIERR_INVALIDPARAM;
+            }
+            const auto axisValid =
+                objectMode == DIEFF_OBJECTOFFSETS
+                ? source.rgdwAxes[0] == DIJOFS_X
+                : DIDFT_GETTYPE(source.rgdwAxes[0]) == DIDFT_ABSAXIS &&
+                    DIDFT_GETINSTANCE(source.rgdwAxes[0]) == 0;
+            if (!axisValid) return DIERR_INVALIDPARAM;
+        }
+        if (full || (requested & DIEP_DIRECTION) != 0) {
+            if (source.cAxes != 1 ||
+                source.rglDirection == nullptr ||
+                source.rglDirection[0] == 0 ||
+                source.rglDirection[0] < -10000 ||
+                source.rglDirection[0] > 10000 ||
+                (source.dwFlags & DIEFF_CARTESIAN) == 0) {
+                return DIERR_INVALIDPARAM;
+            }
+            target.direction =
+                source.rglDirection[0] < 0 ? -1 : 1;
+        }
+        if (full || (requested & DIEP_ENVELOPE) != 0) {
+            target.hasEnvelope = source.lpEnvelope != nullptr;
+            if (source.lpEnvelope == nullptr) {
+                target.envelope = {};
+            } else {
             if (source.lpEnvelope->dwSize < sizeof(DIENVELOPE) ||
                 source.lpEnvelope->dwAttackLevel > 10000 ||
                 source.lpEnvelope->dwFadeLevel > 10000) {
@@ -641,8 +727,15 @@ private:
             }
             target.envelope = *source.lpEnvelope;
             target.hasEnvelope = true;
+            }
         }
 
+        const auto updateTypeSpecific =
+            full || (requested & DIEP_TYPESPECIFICPARAMS) != 0;
+        if (!updateTypeSpecific) return S_OK;
+        if (source.lpvTypeSpecificParams == nullptr) {
+            return DIERR_INVALIDPARAM;
+        }
         switch (effectId) {
         case kConstantEffectId: {
             if (source.cbTypeSpecificParams != sizeof(DICONSTANTFORCE)) {
@@ -686,7 +779,7 @@ private:
                 parameters.lOffset < -10000 ||
                 parameters.lOffset > 10000 ||
                 parameters.dwPhase >= 36000 ||
-                parameters.dwPeriod == 0) {
+                parameters.dwPeriod < kMinimumEffectPeriodUs) {
                 return DIERR_INVALIDPARAM;
             }
             target.kind = effectId == kSquareEffectId ? EffectKind::Square
@@ -735,7 +828,7 @@ private:
                 *static_cast<const DICUSTOMFORCE*>(source.lpvTypeSpecificParams);
             constexpr DWORD kMaximumCustomSamples = 4096;
             if (parameters.cChannels != 1 ||
-                parameters.dwSamplePeriod == 0 ||
+                parameters.dwSamplePeriod < kMinimumEffectPeriodUs ||
                 (source.dwSamplePeriod != 0 &&
                  source.dwSamplePeriod != parameters.dwSamplePeriod) ||
                 parameters.cSamples == 0 ||
