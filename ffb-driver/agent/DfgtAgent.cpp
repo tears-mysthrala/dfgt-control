@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <winrt/base.h>
@@ -14,11 +15,15 @@
 #include "ControlClient.h"
 #include "DeviceDiscovery.h"
 #include "ProfileStore.h"
+#include "../shared/AgentUiProtocol.h"
+#include "../shared/BoundedIo.h"
+#include "../shared/PipePeerValidation.h"
 
 namespace {
 
 constexpr UINT kTrayMessage = WM_APP + 1;
 constexpr UINT kForegroundChanged = WM_APP + 2;
+constexpr UINT kUiBridgeRequest = WM_APP + 3;
 constexpr UINT_PTR kForegroundTimer = 1;
 constexpr UINT_PTR kMaintenanceTimer = 2;
 constexpr UINT kMenuOpen = 1001;
@@ -73,6 +78,8 @@ public:
     int Run(HINSTANCE instance) {
         instance_ = instance;
         if (!InitialiseWindow()) return 10;
+        uiServer_ = std::jthread(
+            [this](std::stop_token stop) { RunUiServer(stop); });
         RegisterForDeviceChanges();
         if (!InitialiseControl()) {
             UpdateTray(L"DFGT Control · broker no disponible");
@@ -384,7 +391,91 @@ private:
             DEVICE_NOTIFY_WINDOW_HANDLE);
     }
 
+    struct UiBridgeCall final {
+        dfgt::agentui::Command command{};
+        dfgt::ipc::control::Status status{};
+        HRESULT result{E_FAIL};
+    };
+
+    void RunUiServer(std::stop_token stop) {
+        while (!stop.stop_requested()) {
+            const auto pipe = CreateNamedPipeW(
+                dfgt::agentui::PipeName,
+                PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+                PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT |
+                    PIPE_REJECT_REMOTE_CLIENTS,
+                1,
+                sizeof(dfgt::agentui::Response),
+                sizeof(dfgt::agentui::Request),
+                0,
+                nullptr);
+            if (pipe == INVALID_HANDLE_VALUE) return;
+            const auto connected = dfgt::io::ConnectPipe(pipe, 500);
+            if (FAILED(connected)) {
+                CloseHandle(pipe);
+                continue;
+            }
+            ULONG clientPid = 0;
+            dfgt::agentui::Request request{};
+            if (GetNamedPipeClientProcessId(pipe, &clientPid) &&
+                clientPid != 0 &&
+                dfgt::ipc::SameUserToken(clientPid)) {
+                const auto read = dfgt::io::ReadExact(
+                    pipe, &request, sizeof(request), 500);
+                if (read.Succeeded(sizeof(request)) &&
+                    request.magic == dfgt::agentui::Magic &&
+                    request.version == dfgt::agentui::Version &&
+                    request.size == sizeof(request) &&
+                    request.command >=
+                        dfgt::agentui::Command::GetStatus &&
+                    request.command <=
+                        dfgt::agentui::Command::AcknowledgeAndRearm) {
+                    UiBridgeCall call{};
+                    call.command = request.command;
+                    DWORD_PTR messageResult = 0;
+                    const auto delivered = SendMessageTimeoutW(
+                        window_,
+                        kUiBridgeRequest,
+                        0,
+                        reinterpret_cast<LPARAM>(&call),
+                        SMTO_ABORTIFHUNG | SMTO_BLOCK,
+                        500,
+                        &messageResult);
+                    if (delivered == 0) call.result =
+                        HRESULT_FROM_WIN32(GetLastError());
+                    dfgt::agentui::Response response{};
+                    response.sequence = request.sequence;
+                    response.result = call.result;
+                    response.deviceState =
+                        static_cast<std::uint32_t>(
+                            call.status.state);
+                    response.connected = call.status.connected;
+                    response.ffbClientConnected =
+                        call.status.ffbClientConnected;
+                    response.safetyMode = call.status.safetyMode;
+                    response.activeSlots = call.status.activeSlots;
+                    response.stopConfirmed =
+                        call.status.stopConfirmed;
+                    response.lastSafetyError =
+                        call.status.lastSafetyError;
+                    response.safetyGeneration =
+                        call.status.safetyGeneration;
+                    wcsncpy_s(
+                        response.activeProfileId,
+                        call.status.activeProfileId,
+                        _TRUNCATE);
+                    dfgt::io::WriteExact(
+                        pipe, &response, sizeof(response), 500);
+                }
+            }
+            DisconnectNamedPipe(pipe);
+            CloseHandle(pipe);
+        }
+    }
+
     void Shutdown() {
+        uiServer_.request_stop();
+        if (uiServer_.joinable()) uiServer_.join();
         if (deviceNotification_ != nullptr) {
             UnregisterDeviceNotification(deviceNotification_);
             deviceNotification_ = nullptr;
@@ -402,6 +493,28 @@ private:
         WPARAM wParam,
         LPARAM lParam) {
         switch (message) {
+        case kUiBridgeRequest: {
+            auto* call = reinterpret_cast<UiBridgeCall*>(lParam);
+            if (call == nullptr) return 0;
+            if (call->command ==
+                dfgt::agentui::Command::EmergencyStop) {
+                call->result = control_.EmergencyStop();
+            } else if (
+                call->command ==
+                dfgt::agentui::Command::AcknowledgeAndRearm) {
+                call->result = control_.AcknowledgeAndRearm();
+            } else {
+                call->result = control_.GetStatus(call->status);
+                return 0;
+            }
+            const auto statusResult =
+                control_.GetStatus(call->status);
+            if (SUCCEEDED(call->result) &&
+                FAILED(statusResult)) {
+                call->result = statusResult;
+            }
+            return 0;
+        }
         case WM_DEVICECHANGE:
             if (wParam == DBT_DEVICEARRIVAL ||
                 wParam == DBT_DEVICEREMOVECOMPLETE) {
@@ -566,6 +679,7 @@ private:
     ULONGLONG nextBrokerAttempt_{};
     ULONGLONG nextAttachAttempt_{};
     DWORD brokerBackoffMs_{500};
+    std::jthread uiServer_;
 };
 
 } // namespace

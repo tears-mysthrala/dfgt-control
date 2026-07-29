@@ -72,13 +72,14 @@
             <TextBlock Text="AJUSTES DEL PERFIL" FontSize="12" FontWeight="Bold"
                        Foreground="{StaticResource MutedBrush}"/>
             <TextBlock Text="Nombre" Margin="0,18,0,6"/>
-            <TextBox x:Name="ProfileName"/>
+            <TextBox x:Name="ProfileName" TextChanged="Editor_OnChanged"/>
             <TextBlock Text="Ejecutable del juego (vacío = escritorio)"
                        Margin="0,15,0,6"/>
             <DockPanel>
               <Button DockPanel.Dock="Right" Content="Elegir…" Margin="10,0,0,0"
                       Click="BrowseExecutable_OnClick"/>
-              <TextBox x:Name="ExecutablePath" IsReadOnly="True"/>
+              <TextBox x:Name="ExecutablePath" IsReadOnly="True"
+                       TextChanged="Editor_OnChanged"/>
             </DockPanel>
 
             <Grid Margin="0,22,0,0">
@@ -147,6 +148,12 @@
       <TextBlock x:Name="SaveStatus" Foreground="{StaticResource MutedBrush}"
                  VerticalAlignment="Center"/>
       <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+        <Button x:Name="EmergencyButton" Content="Parada de emergencia"
+                Background="#8E3434" Margin="0,0,10,0"
+                Click="EmergencyStop_OnClick"/>
+        <Button x:Name="RearmButton" Content="Rearmar" IsEnabled="False"
+                Background="#725D2B" Margin="0,0,10,0"
+                Click="Rearm_OnClick"/>
         <Button Content="Eliminar" Background="#343D47" Foreground="{StaticResource InkBrush}"
                 Margin="0,0,10,0" Click="DeleteProfile_OnClick"/>
         <Button Content="Guardar y aplicar" Click="Save_OnClick"/>

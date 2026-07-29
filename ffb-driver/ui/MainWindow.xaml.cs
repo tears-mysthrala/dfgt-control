@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Media;
@@ -24,14 +25,17 @@ public partial class MainWindow : Window
     private int loadedRevision;
     private bool loading;
     private bool agentStartAttempted;
+    private bool refreshingStatus;
+    private bool dirty;
+    private Profile? editingProfile;
 
     public MainWindow()
     {
         InitializeComponent();
         LoadProfiles();
-        RefreshAgentStatus();
+        _ = RefreshAgentStatusAsync();
         var timer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(2) };
-        timer.Tick += (_, _) => RefreshAgentStatus();
+        timer.Tick += async (_, _) => await RefreshAgentStatusAsync();
         timer.Start();
     }
 
@@ -117,40 +121,149 @@ public partial class MainWindow : Window
         catch (UnauthorizedAccessException) { return false; }
     }
 
-    private void RefreshAgentStatus()
+    private async Task RefreshAgentStatusAsync()
     {
-        var running = Process.GetProcessesByName("DfgtAgent").Length != 0;
-        if (!running && !agentStartAttempted)
+        if (refreshingStatus) return;
+        refreshingStatus = true;
+        try
         {
-            agentStartAttempted = true;
-            var agent = Path.Combine(AppContext.BaseDirectory, "DfgtAgent.exe");
-            if (File.Exists(agent))
+            var status = await AgentClient.ExchangeAsync(
+                AgentCommand.GetStatus);
+            var safe = status.SafetyMode is 3 or 4;
+            AgentStatus.Text = status.SafetyMode switch
             {
-                try
-                {
-                    Process.Start(new ProcessStartInfo(agent)
-                    {
-                        UseShellExecute = false,
-                        WorkingDirectory = AppContext.BaseDirectory
-                    });
-                }
-                catch
-                {
-                    // Status remains red; installation may be incomplete.
-                }
-                running = Process.GetProcessesByName("DfgtAgent").Length != 0;
-            }
+                5 => "PARADA ENCLAVADA",
+                6 => "PARADA NO CONFIRMADA · desconecta el volante",
+                7 => $"Fallo de seguridad · 0x{status.LastSafetyError:X8}",
+                _ when status.Connected && status.FfbClientConnected =>
+                    "Volante y juego conectados",
+                _ when status.Connected => "Volante preparado",
+                _ => "Agente activo · volante desconectado"
+            };
+            var hvci = ReadHvciState();
+            var profile = string.IsNullOrEmpty(status.ActiveProfileId)
+                ? "sin perfil activo"
+                : $"perfil {status.ActiveProfileId}";
+            AgentStatus.Text += $" · {profile} · HVCI {hvci}";
+            AgentDot.Fill = new SolidColorBrush(
+                (Color)ColorConverter.ConvertFromString(
+                    status.SafetyMode == 6 ? "#E96868" :
+                    status.SafetyMode == 5 ? "#F2B84B" :
+                    safe ? "#35D6A0" : "#66717E"));
+            RearmButton.IsEnabled =
+                status.SafetyMode == 5 && status.StopConfirmed;
+            EmergencyButton.IsEnabled = status.Connected;
+            return;
         }
-        AgentStatus.Text = running ? "Agente activo" : "Agente detenido";
-        AgentDot.Fill = new SolidColorBrush(
-            (Color)ColorConverter.ConvertFromString(running ? "#35D6A0" : "#E96868"));
+        catch (Exception error) when (
+            error is IOException or TimeoutException or
+            UnauthorizedAccessException or OperationCanceledException or
+            COMException)
+        {
+            if (!agentStartAttempted)
+            {
+                agentStartAttempted = true;
+                var agent = Path.Combine(
+                    AppContext.BaseDirectory, "DfgtAgent.exe");
+                if (File.Exists(agent))
+                {
+                    try
+                    {
+                        Process.Start(new ProcessStartInfo(agent)
+                        {
+                            UseShellExecute = false,
+                            WorkingDirectory = AppContext.BaseDirectory
+                        });
+                    }
+                    catch { }
+                }
+            }
+            AgentStatus.Text = "Agente no disponible";
+            AgentDot.Fill = new SolidColorBrush(
+                (Color)ColorConverter.ConvertFromString("#E96868"));
+            EmergencyButton.IsEnabled = false;
+            RearmButton.IsEnabled = false;
+        }
+        finally
+        {
+            refreshingStatus = false;
+        }
+    }
+
+    private static string ReadHvciState()
+    {
+        try
+        {
+            using var key = Registry.LocalMachine.OpenSubKey(
+                @"SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\" +
+                "HypervisorEnforcedCodeIntegrity");
+            return Convert.ToInt32(key?.GetValue("Enabled", -1)) switch
+            {
+                1 => "configurado",
+                0 => "desactivado",
+                _ => "desconocido"
+            };
+        }
+        catch (Exception error) when (
+            error is IOException or UnauthorizedAccessException or
+            System.Security.SecurityException)
+        {
+            return "desconocido";
+        }
+    }
+
+    private async void EmergencyStop_OnClick(
+        object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            var status = await AgentClient.ExchangeAsync(
+                AgentCommand.EmergencyStop);
+            AgentStatus.Text = status.StopConfirmed
+                ? "PARADA ENCLAVADA · fuerza neutral confirmada"
+                : "PARADA NO CONFIRMADA · desconecta el volante";
+        }
+        catch (Exception error)
+        {
+            AgentStatus.Text =
+                $"No se pudo confirmar la parada: {error.Message}";
+        }
+        await RefreshAgentStatusAsync();
+    }
+
+    private async void Rearm_OnClick(object sender, RoutedEventArgs e)
+    {
+        if (MessageBox.Show(
+                this,
+                "El rearme permite que los juegos vuelvan a producir fuerza. " +
+                "Confirma que el volante puede moverse con seguridad.",
+                "Rearmar force feedback",
+                MessageBoxButton.OKCancel,
+                MessageBoxImage.Warning) != MessageBoxResult.OK)
+            return;
+        try
+        {
+            await AgentClient.ExchangeAsync(
+                AgentCommand.AcknowledgeAndRearm);
+        }
+        catch (Exception error)
+        {
+            AgentStatus.Text = $"Rearme rechazado: {error.Message}";
+        }
+        await RefreshAgentStatusAsync();
     }
 
     private Profile? Selected => ProfilesList.SelectedItem as Profile;
 
     private void ProfilesList_OnSelectionChanged(object sender, SelectionChangedEventArgs e)
     {
+        if (editingProfile is not null && dirty && !loading)
+        {
+            CopyEditorTo(editingProfile);
+            SaveStatus.Text = "Cambios sin guardar conservados en memoria";
+        }
         if (Selected is not { } profile) return;
+        editingProfile = profile;
         loading = true;
         ProfileName.Text = profile.Name;
         ExecutablePath.Text = profile.ExecutablePath;
@@ -214,6 +327,7 @@ public partial class MainWindow : Window
             else
                 File.Move(temporary, profilePath);
             loadedRevision = document.Revision;
+            dirty = false;
             ProfilesList.Items.Refresh();
             SaveStatus.Text = "Guardado · pendiente de confirmación del agente";
         }
@@ -232,6 +346,7 @@ public partial class MainWindow : Window
         document.Profiles.Add(profile);
         ProfilesList.Items.Refresh();
         ProfilesList.SelectedItem = profile;
+        dirty = true;
     }
 
     private void DeleteProfile_OnClick(object sender, RoutedEventArgs e)
@@ -240,6 +355,7 @@ public partial class MainWindow : Window
         document.Profiles.Remove(profile);
         ProfilesList.Items.Refresh();
         ProfilesList.SelectedIndex = 0;
+        dirty = true;
         SaveStatus.Text = "Pulsa «Guardar y aplicar» para confirmar";
     }
 
@@ -257,12 +373,38 @@ public partial class MainWindow : Window
 
     private void Range_OnValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
     {
-        if (!loading) UpdateLabels();
+        if (!loading)
+        {
+            dirty = true;
+            UpdateLabels();
+        }
     }
 
     private void Percent_OnValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
     {
-        if (!loading) UpdateLabels();
+        if (!loading)
+        {
+            dirty = true;
+            UpdateLabels();
+        }
+    }
+
+    private void Editor_OnChanged(object sender, TextChangedEventArgs e)
+    {
+        if (!loading) dirty = true;
+    }
+
+    protected override void OnClosing(
+        System.ComponentModel.CancelEventArgs e)
+    {
+        if (dirty && MessageBox.Show(
+                this,
+                "Hay cambios sin guardar. ¿Cerrar y descartarlos?",
+                "DFGT Control",
+                MessageBoxButton.OKCancel,
+                MessageBoxImage.Warning) != MessageBoxResult.OK)
+            e.Cancel = true;
+        base.OnClosing(e);
     }
 
     private void UpdateLabels()
@@ -350,7 +492,17 @@ internal static class ProfileValidator
             {
                 if (!Path.IsPathFullyQualified(profile.ExecutablePath))
                     return Fail("ruta no absoluta", out error);
-                var normalized = Path.GetFullPath(profile.ExecutablePath);
+                string normalized;
+                try
+                {
+                    normalized = Path.GetFullPath(profile.ExecutablePath);
+                }
+                catch (Exception pathError) when (
+                    pathError is ArgumentException or NotSupportedException or
+                    PathTooLongException)
+                {
+                    return Fail("ruta inválida", out error);
+                }
                 if (!paths.Add(normalized))
                     return Fail("ejecutable duplicado", out error);
             }
