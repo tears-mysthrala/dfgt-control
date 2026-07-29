@@ -90,20 +90,95 @@ $deviceChecks = @(
             }
         }
 )
+$comChecks = @(
+    foreach ($item in @(
+        @{
+            architecture = 'x64'
+            path = "HKLM:\SOFTWARE\Classes\CLSID\$expectedClsid\InProcServer32"
+        },
+        @{
+            architecture = 'x86'
+            path = "HKLM:\SOFTWARE\Classes\WOW6432Node\CLSID\$expectedClsid\InProcServer32"
+        }
+    )) {
+        $registeredPath = if (Test-Path -LiteralPath $item.path) {
+            (Get-Item -LiteralPath $item.path).GetValue('')
+        }
+        else { $null }
+        $exists = $registeredPath -and
+            (Test-Path -LiteralPath $registeredPath -PathType Leaf)
+        [ordered]@{
+            architecture = $item.architecture
+            registryPath = $item.path
+            serverPath = $registeredPath
+            exists = [bool]$exists
+            ownedByManifest = [bool]($exists -and $manifest -and
+                @($manifest.files.path) -contains $registeredPath)
+        }
+    }
+)
+$filterChecks = @(
+    Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue |
+        Where-Object InstanceId -like '*VID_046D&PID_C29A*' |
+        ForEach-Object {
+            $upper = @(Get-PnpDeviceProperty -InstanceId $_.InstanceId `
+                -KeyName 'DEVPKEY_Device_UpperFilters' `
+                -ErrorAction SilentlyContinue).Data
+            $lower = @(Get-PnpDeviceProperty -InstanceId $_.InstanceId `
+                -KeyName 'DEVPKEY_Device_LowerFilters' `
+                -ErrorAction SilentlyContinue).Data
+            [ordered]@{
+                instanceId = $_.InstanceId
+                upperFilters = $upper
+                lowerFilters = $lower
+                legacyFilterPresent = [bool](
+                    @($upper + $lower) |
+                        Where-Object { $_ -in $legacyServices })
+            }
+        }
+)
+$codeIntegrityEvents = try {
+    @(
+        Get-WinEvent -FilterHashtable @{
+            LogName = 'Microsoft-Windows-CodeIntegrity/Operational'
+            StartTime = (Get-Date).AddDays(-7)
+        } -MaxEvents 100 -ErrorAction Stop |
+            Where-Object {
+                $_.Message -match '(?i)DfgtControl|DfgtDirectInputFfb|DfgtFfbBroker|DfgtAgent'
+            } |
+            Select-Object TimeCreated, Id, LevelDisplayName, Message
+    )
+}
+catch {
+    @()
+}
 
 $hvciRunning = $deviceGuard.SecurityServicesRunning -contains 2
-$passed = $hvciRegistry -eq 1 -and
+$requiredPassed = $hvciRegistry -eq 1 -and
     $hvciRunning -and
     $manifest -and
     -not ($fileChecks | Where-Object { -not $_.hashMatch }) -and
     $deviceChecks.Count -gt 0 -and
     -not ($deviceChecks | Where-Object { -not $_.microsoftInbox }) -and
     -not ($serviceChecks | Where-Object running) -and
-    -not ($providerChecks | Where-Object { -not $_.matches })
+    -not ($providerChecks | Where-Object { -not $_.matches }) -and
+    -not ($comChecks | Where-Object {
+        -not $_.exists -or -not $_.ownedByManifest }) -and
+    -not ($filterChecks | Where-Object legacyFilterPresent)
+$notTested = @(
+    'DirectInput COM activation x64'
+    'DirectInput COM activation x86'
+    'Broker safety state and neutral confirmation'
+)
+$verdict = if (-not $requiredPassed) { 'fail' }
+    elseif ($notTested.Count -gt 0) { 'incomplete' }
+    else { 'pass' }
 
 [ordered]@{
     capturedAt = (Get-Date).ToString('o')
-    passed = [bool]$passed
+    verdict = $verdict
+    passed = $verdict -eq 'pass'
+    notTested = $notTested
     secureBoot = $secureBoot
     hvci = [ordered]@{
         registryEnabled = $hvciRegistry
@@ -119,6 +194,13 @@ $passed = $hvciRegistry -eq 1 -and
     devices = $deviceChecks
     legacyServices = $serviceChecks
     provider = $providerChecks
+    com = $comChecks
+    filters = $filterChecks
+    codeIntegrityEvents = $codeIntegrityEvents
+    safety = [ordered]@{
+        status = 'notTested'
+        reason = 'Verifier performs no force and no control-pipe session is bundled yet.'
+    }
     manifest = $manifestPath
     files = $fileChecks
 } | ConvertTo-Json -Depth 8

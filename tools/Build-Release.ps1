@@ -50,13 +50,7 @@ Invoke-Checked cmake @(
     '-A', 'Win32')
 Invoke-Checked cmake @(
     '--build', (Join-Path $driver 'build-x86'),
-    '--config', 'Release',
-    '--target',
-    'DfgtDirectInputFfb',
-    'DfgtFfbComSmoke',
-    'DfgtProtocolTests',
-    'DfgtTransportFakeTests',
-    'DfgtSafetyStateTests')
+    '--config', 'Release')
 Invoke-Checked dotnet @(
     'publish', (Join-Path $driver 'ui\DfgtControl.csproj'),
     '-c', 'Release',
@@ -105,6 +99,7 @@ $publicScripts = @(
     'Backup-LogitechLegacyStack.ps1',
     'Install-DfgtFfb.ps1',
     'Remove-LogitechLegacyStack.ps1',
+    'Restore-LogitechLegacyStack.ps1',
     'Uninstall-DfgtFfb.ps1',
     'Verify-HvciStack.ps1'
 )
