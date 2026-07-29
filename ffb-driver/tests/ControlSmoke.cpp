@@ -4,39 +4,41 @@
 #include <iostream>
 
 #include "../shared/BrokerProtocol.h"
+#include "../shared/BoundedIo.h"
+#include "../shared/WireCodec.h"
 
 namespace {
 
 HRESULT Exchange(
     HANDLE pipe,
     dfgt::ipc::control::Request& request,
-    dfgt::ipc::control::Response& response) {
-    DWORD written = 0;
-    if (!WriteFile(
-            pipe,
-            &request,
-            sizeof(request),
-            &written,
-            nullptr) ||
-        written != sizeof(request)) {
-        return HRESULT_FROM_WIN32(GetLastError());
+    dfgt::ipc::control::Response& response,
+    std::uint64_t& nonce) {
+    request.sessionNonce = nonce;
+    const auto encoded =
+        dfgt::ipc::control::wire::Encode(request);
+    const auto write = dfgt::io::WriteExact(
+        pipe, encoded.data(),
+        static_cast<DWORD>(encoded.size()), 500);
+    if (!write.Succeeded(
+            static_cast<DWORD>(encoded.size()))) {
+        return write.result;
     }
-    DWORD read = 0;
-    if (!ReadFile(
-            pipe,
-            &response,
-            sizeof(response),
-            &read,
-            nullptr) ||
-        read != sizeof(response)) {
-        return HRESULT_FROM_WIN32(GetLastError());
+    dfgt::ipc::control::wire::EncodedResponse encodedResponse{};
+    const auto read = dfgt::io::ReadExact(
+        pipe, encodedResponse.data(),
+        static_cast<DWORD>(encodedResponse.size()), 500);
+    if (!read.Succeeded(
+            static_cast<DWORD>(encodedResponse.size()))) {
+        return read.result;
     }
-    if (response.magic != dfgt::ipc::control::Magic ||
-        response.version != dfgt::ipc::control::Version ||
-        response.size != sizeof(response) ||
+    if (!dfgt::ipc::control::wire::Decode(
+            encodedResponse, response) ||
         response.sequence != request.sequence) {
         return E_INVALIDARG;
     }
+    if (nonce == 0) nonce = response.sessionNonce;
+    else if (nonce != response.sessionNonce) return E_ACCESSDENIED;
     return response.result;
 }
 
@@ -58,7 +60,7 @@ int wmain(int argc, wchar_t** argv) {
         0,
         nullptr,
         OPEN_EXISTING,
-        0,
+        FILE_FLAG_OVERLAPPED,
         nullptr);
     if (pipe == INVALID_HANDLE_VALUE) return 5;
     DWORD mode = PIPE_READMODE_MESSAGE;
@@ -69,20 +71,28 @@ int wmain(int argc, wchar_t** argv) {
 
     dfgt::ipc::control::Request request{};
     dfgt::ipc::control::Response response{};
-    request.command = dfgt::ipc::control::Command::AttachDevice;
+    std::uint64_t nonce = 0;
+    request.command = dfgt::ipc::control::Command::Ping;
     request.sequence = 1;
+    if (FAILED(Exchange(pipe, request, response, nonce))) {
+        CloseHandle(pipe);
+        return 7;
+    }
+    request = {};
+    request.command = dfgt::ipc::control::Command::AttachDevice;
+    request.sequence = 2;
     if (wcsncpy_s(
             request.devicePath,
             argv[1],
             _TRUNCATE) != 0 ||
-        FAILED(Exchange(pipe, request, response))) {
+        FAILED(Exchange(pipe, request, response, nonce))) {
         CloseHandle(pipe);
         return 7;
     }
 
     request = {};
     request.command = dfgt::ipc::control::Command::ApplyProfile;
-    request.sequence = 2;
+    request.sequence = 3;
     wcsncpy_s(request.profile.id, L"smoke", _TRUNCATE);
     request.profile.rangeDegrees = 900;
     request.profile.overallGain = 9000;
@@ -91,7 +101,7 @@ int wmain(int argc, wchar_t** argv) {
     request.profile.damperGain = 7000;
     request.profile.frictionGain = 6000;
     request.profile.periodicGain = 9000;
-    if (FAILED(Exchange(pipe, request, response))) {
+    if (FAILED(Exchange(pipe, request, response, nonce))) {
         CloseHandle(pipe);
         return 8;
     }
@@ -99,8 +109,9 @@ int wmain(int argc, wchar_t** argv) {
     if (holdMs != 0) Sleep(static_cast<DWORD>(holdMs));
     request = {};
     request.command = dfgt::ipc::control::Command::GetStatus;
-    request.sequence = 3;
-    const auto result = Exchange(pipe, request, response);
+    request.sequence = 4;
+    const auto result = Exchange(
+        pipe, request, response, nonce);
     CloseHandle(pipe);
     if (FAILED(result)) return 9;
 

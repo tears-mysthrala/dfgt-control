@@ -19,6 +19,7 @@
 #include "../shared/BrokerProtocol.h"
 #include "../shared/DfgtReports.h"
 #include "../shared/BoundedIo.h"
+#include "../shared/WireCodec.h"
 #include "SafetyState.h"
 #include "EffectCoordinator.h"
 #include "LeaseWatchdog.h"
@@ -594,17 +595,26 @@ bool ReadMessageWithTimeout(
         }
         DWORD available = 0;
         if (!PeekNamedPipe(pipe, nullptr, 0, nullptr, &available, nullptr)) return false;
-        if (available >= sizeof(message)) {
+        if (available >= dfgt::ipc::wire::MessageSize) {
+            dfgt::ipc::wire::EncodedMessage encoded{};
             const auto read = dfgt::io::ReadExact(
-                pipe, &message, sizeof(message), kPipeIoTimeoutMs);
-            if (!read.Succeeded(sizeof(message))) {
+                pipe, encoded.data(),
+                static_cast<DWORD>(encoded.size()),
+                kPipeIoTimeoutMs);
+            if (!read.Succeeded(
+                    static_cast<DWORD>(encoded.size())) ||
+                !dfgt::ipc::wire::Decode(encoded, message)) {
                 SetLastError(HRESULT_CODE(read.result));
+                if (SUCCEEDED(read.result)) {
+                    SetLastError(ERROR_INVALID_DATA);
+                }
                 return false;
             }
             return true;
         }
         if (!forceActive && GetTickCount64() >= leaseDeadline) {
-            SetLastError(ERROR_TIMEOUT);
+            SetLastError(
+                available == 0 ? ERROR_TIMEOUT : ERROR_INVALID_DATA);
             return false;
         }
         Sleep(5);
@@ -617,12 +627,21 @@ HRESULT ProcessMessage(
     bool& opened,
     bool& forceActive,
     std::uint64_t& sessionGeneration,
+    std::uint64_t expectedNonce,
     bool suppressForceWrites) {
     using dfgt::ipc::Command;
     if (message.magic != dfgt::ipc::Magic ||
         message.version != dfgt::ipc::Version ||
         message.size != sizeof(message)) {
         return E_INVALIDARG;
+    }
+    if (message.capabilities !=
+            dfgt::ipc::RequiredCapabilities ||
+        message.buildId != dfgt::ipc::BuildId ||
+        (message.command == Command::Open
+            ? message.sessionNonce != 0
+            : message.sessionNonce != expectedNonce)) {
+        return E_ACCESSDENIED;
     }
 
     switch (message.command) {
@@ -905,10 +924,14 @@ bool WriteResponse(
     HANDLE pipe,
     std::uint32_t sequence,
     HRESULT result,
+    std::uint64_t sessionNonce,
     BrokerState& state) {
     dfgt::ipc::Response response{};
     response.sequence = sequence;
     response.result = result;
+    response.capabilities = dfgt::ipc::RequiredCapabilities;
+    response.sessionNonce = sessionNonce;
+    response.buildId = dfgt::ipc::BuildId;
     {
         std::scoped_lock lock(state.stateMutex);
         response.safetyMode =
@@ -924,9 +947,13 @@ bool WriteResponse(
         response.stopConfirmed =
             state.safety.StopConfirmed() ? 1u : 0u;
     }
+    const auto encoded = dfgt::ipc::wire::Encode(response);
     const auto write = dfgt::io::WriteExact(
-        pipe, &response, sizeof(response), kPipeIoTimeoutMs);
-    return write.Succeeded(sizeof(response));
+        pipe, encoded.data(),
+        static_cast<DWORD>(encoded.size()),
+        kPipeIoTimeoutMs);
+    return write.Succeeded(
+        static_cast<DWORD>(encoded.size()));
 }
 
 SECURITY_ATTRIBUTES MakePipeSecurity(PSECURITY_DESCRIPTOR& descriptor) {
@@ -1022,6 +1049,7 @@ int RunClient(
     std::int32_t maximumAbsoluteConstant = 0;
     std::uint64_t stopAllCount = 0;
     std::uint64_t heartbeatCount = 0;
+    std::uint32_t lastSequence = 0;
     dfgt::broker::LeaseWatchdog watchdog{
         std::chrono::milliseconds(kReadTimeoutMs)};
     const auto watchdogStart = std::chrono::steady_clock::now();
@@ -1070,13 +1098,19 @@ int RunClient(
                 << std::flush;
             return 0;
         }
-        const auto result = ProcessMessage(
-            message,
-            state,
-            opened,
-            forceActive,
-            sessionGeneration,
-            suppressForceWrites);
+        const auto sequenceValid =
+            message.sequence > lastSequence;
+        const auto effectiveResult = sequenceValid
+            ? ProcessMessage(
+                message,
+                state,
+                opened,
+                forceActive,
+                sessionGeneration,
+                sessionNonce,
+                suppressForceWrites)
+            : E_INVALIDARG;
+        if (sequenceValid) lastSequence = message.sequence;
         {
             std::scoped_lock lock(state.stateMutex);
             forceActive =
@@ -1091,7 +1125,7 @@ int RunClient(
                 << L",\"command\":"
                 << static_cast<std::uint32_t>(message.command)
                 << L",\"value\":" << message.value
-                << L",\"result\":" << result
+                << L",\"result\":" << effectiveResult
                 << L"}\n"
                 << std::flush;
         }
@@ -1112,7 +1146,7 @@ int RunClient(
         const auto rendererProgressed =
             message.command != dfgt::ipc::Command::Heartbeat ||
             watchdog.ObserveRenderer(message.renderEpoch, now);
-        if (SUCCEEDED(result) && forceActive && rendererProgressed &&
+        if (SUCCEEDED(effectiveResult) && forceActive && rendererProgressed &&
             (message.command == dfgt::ipc::Command::Constant ||
              message.command == dfgt::ipc::Command::Spring ||
              message.command == dfgt::ipc::Command::Damper ||
@@ -1129,7 +1163,8 @@ int RunClient(
             leaseDeadline = GetTickCount64() + kReadTimeoutMs;
         }
         if (!WriteResponse(
-                pipe, message.sequence, result, state)) {
+                pipe, message.sequence, effectiveResult,
+                sessionNonce, state)) {
             HRESULT stopResult = S_OK;
             {
                 std::scoped_lock lock(state.deviceMutex);
@@ -1146,6 +1181,10 @@ int RunClient(
                     state.stopRecoveryRequested = true;
                 }
             }
+            return 0;
+        }
+        if (!sequenceValid ||
+            effectiveResult == E_ACCESSDENIED) {
             return 0;
         }
         if (message.command == dfgt::ipc::Command::Close) {
@@ -1203,12 +1242,23 @@ dfgt::ipc::control::Status SnapshotStatus(BrokerState& state) {
 
 HRESULT ProcessControlRequest(
     const dfgt::ipc::control::Request& request,
-    BrokerState& state) {
+    BrokerState& state,
+    std::uint64_t expectedNonce) {
     using dfgt::ipc::control::Command;
     if (request.magic != dfgt::ipc::control::Magic ||
         request.version != dfgt::ipc::control::Version ||
         request.size != sizeof(request)) {
         return E_INVALIDARG;
+    }
+    if (request.capabilities !=
+            dfgt::ipc::RequiredCapabilities ||
+        request.buildId != dfgt::ipc::BuildId ||
+        (request.command ==
+                dfgt::ipc::control::Command::Ping &&
+            request.sessionNonce == 0
+            ? false
+            : request.sessionNonce != expectedNonce)) {
+        return E_ACCESSDENIED;
     }
 
     HRESULT result = S_OK;
@@ -1364,31 +1414,90 @@ void RunControlServer(
             if (stop.stop_requested()) return;
             continue;
         }
+        ULONG clientPid = 0;
+        ULONG clientSession = 0;
+        DWORD brokerSession = 0;
+        GetNamedPipeClientProcessId(pipe, &clientPid);
+        GetNamedPipeClientSessionId(pipe, &clientSession);
+        ProcessIdToSessionId(
+            GetCurrentProcessId(), &brokerSession);
+        dfgt::broker::ClientProcessWatch clientProcess(clientPid);
+        std::uint64_t sessionNonce = 0;
+        const auto nonceStatus = BCryptGenRandom(
+            nullptr,
+            reinterpret_cast<PUCHAR>(&sessionNonce),
+            sizeof(sessionNonce),
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+        if (clientPid == 0 || !clientProcess.Valid() ||
+            clientSession != brokerSession ||
+            nonceStatus < 0 || sessionNonce == 0) {
+            DisconnectNamedPipe(pipe);
+            CloseHandle(pipe);
+            continue;
+        }
         {
             std::scoped_lock lock(state.stateMutex);
             state.controlClientConnected = true;
         }
+        std::uint32_t lastSequence = 0;
 
         for (;;) {
             dfgt::ipc::control::Request request{};
+            dfgt::ipc::control::wire::EncodedRequest encodedRequest{};
             const auto read = dfgt::io::ReadExact(
-                pipe, &request, sizeof(request), kPipeIoTimeoutMs);
-            if (!read.Succeeded(sizeof(request))) {
+                pipe, encodedRequest.data(),
+                static_cast<DWORD>(encodedRequest.size()),
+                kPipeIoTimeoutMs);
+            if (!read.Succeeded(
+                    static_cast<DWORD>(encodedRequest.size())) ||
+                !dfgt::ipc::control::wire::Decode(
+                    encodedRequest, request)) {
                 if (read.result ==
                         HRESULT_FROM_WIN32(ERROR_TIMEOUT) &&
                     !stop.stop_requested()) {
-                    continue;
+                    DWORD available = 0;
+                    if (PeekNamedPipe(
+                            pipe, nullptr, 0, nullptr,
+                            &available, nullptr) &&
+                        available == 0 &&
+                        !clientProcess.Terminated()) {
+                        continue;
+                    }
                 }
                 break;
             }
-            const auto result = ProcessControlRequest(request, state);
+            const auto sequenceValid =
+                request.sequence > lastSequence;
+            const auto firstPing =
+                lastSequence == 0 &&
+                request.command ==
+                    dfgt::ipc::control::Command::Ping &&
+                request.sessionNonce == 0;
+            const auto nonceValid =
+                firstPing ||
+                request.sessionNonce == sessionNonce;
+            const auto result =
+                sequenceValid && nonceValid
+                ? ProcessControlRequest(
+                    request, state, sessionNonce)
+                : E_ACCESSDENIED;
+            if (sequenceValid) lastSequence = request.sequence;
             dfgt::ipc::control::Response response{};
             response.sequence = request.sequence;
             response.result = result;
             response.status = SnapshotStatus(state);
+            response.capabilities =
+                dfgt::ipc::RequiredCapabilities;
+            response.sessionNonce = sessionNonce;
+            response.buildId = dfgt::ipc::BuildId;
+            const auto encodedResponse =
+                dfgt::ipc::control::wire::Encode(response);
             const auto write = dfgt::io::WriteExact(
-                pipe, &response, sizeof(response), kPipeIoTimeoutMs);
-            if (!write.Succeeded(sizeof(response))) {
+                pipe, encodedResponse.data(),
+                static_cast<DWORD>(encodedResponse.size()),
+                kPipeIoTimeoutMs);
+            if (!write.Succeeded(
+                    static_cast<DWORD>(encodedResponse.size()))) {
                 break;
             }
             if (diagnostics) {
@@ -1399,6 +1508,10 @@ void RunControlServer(
                     << static_cast<std::uint32_t>(request.command)
                     << L",\"result\":" << result << L"}\n"
                     << std::flush;
+            }
+            if (!sequenceValid || !nonceValid ||
+                result == E_ACCESSDENIED) {
+                break;
             }
         }
 

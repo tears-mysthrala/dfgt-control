@@ -5,13 +5,21 @@
 
 namespace dfgt::ipc {
 
-inline constexpr wchar_t FfbPipeName[] = LR"(\\.\pipe\DfgtFfbBroker.v1)";
-inline constexpr wchar_t PipeName[] = LR"(\\.\pipe\DfgtFfbBroker.v1)";
+inline constexpr wchar_t FfbPipeName[] = LR"(\\.\pipe\DfgtFfbBroker.v2)";
+inline constexpr wchar_t PipeName[] = LR"(\\.\pipe\DfgtFfbBroker.v2)";
 inline constexpr wchar_t ControlPipeName[] =
-    LR"(\\.\pipe\DfgtFfbBroker.control.v1)";
+    LR"(\\.\pipe\DfgtFfbBroker.control.v2)";
 inline constexpr std::uint32_t Magic = 0x54474644; // "DFGT" little-endian
-inline constexpr std::uint16_t Version = 3;
+inline constexpr std::uint16_t Version = 4;
 inline constexpr std::size_t DevicePathCharacters = 512;
+inline constexpr std::uint64_t BuildId = 0x202607290001ULL;
+inline constexpr std::uint64_t CapabilitySafetyState = 1ULL << 0;
+inline constexpr std::uint64_t CapabilitySlotIsolation = 1ULL << 1;
+inline constexpr std::uint64_t CapabilityRenderEpoch = 1ULL << 2;
+inline constexpr std::uint64_t RequiredCapabilities =
+    CapabilitySafetyState |
+    CapabilitySlotIsolation |
+    CapabilityRenderEpoch;
 
 enum class SafetyMode : std::uint32_t {
     Disconnected = 0,
@@ -51,6 +59,9 @@ struct Message {
     std::int32_t value5{};
     std::int32_t value6{};
     std::uint64_t renderEpoch{};
+    std::uint64_t capabilities{RequiredCapabilities};
+    std::uint64_t sessionNonce{};
+    std::uint64_t buildId{BuildId};
     wchar_t devicePath[DevicePathCharacters]{};
 };
 
@@ -64,15 +75,18 @@ struct Response {
     std::uint32_t activeSlots{};
     std::uint32_t connected{};
     std::uint32_t stopConfirmed{};
+    std::uint64_t capabilities{RequiredCapabilities};
+    std::uint64_t sessionNonce{};
+    std::uint64_t buildId{BuildId};
 };
 
 static_assert(sizeof(Message) <= 4096);
-static_assert(sizeof(Response) == 32);
+static_assert(sizeof(Response) <= 64);
 
 namespace control {
 
 inline constexpr std::uint32_t Magic = 0x43474644; // "DFGC" little-endian
-inline constexpr std::uint16_t Version = 1;
+inline constexpr std::uint16_t Version = 2;
 inline constexpr std::size_t ProfileIdCharacters = 64;
 
 enum class Command : std::uint32_t {
@@ -111,6 +125,9 @@ struct Request {
     std::uint16_t size{sizeof(Request)};
     Command command{};
     std::uint32_t sequence{};
+    std::uint64_t capabilities{RequiredCapabilities};
+    std::uint64_t sessionNonce{};
+    std::uint64_t buildId{BuildId};
     Profile profile{};
     wchar_t devicePath[DevicePathCharacters]{};
 };
@@ -139,6 +156,9 @@ struct Response {
     std::uint16_t size{sizeof(Response)};
     std::uint32_t sequence{};
     std::int32_t result{};
+    std::uint64_t capabilities{RequiredCapabilities};
+    std::uint64_t sessionNonce{};
+    std::uint64_t buildId{BuildId};
     Status status{};
 };
 

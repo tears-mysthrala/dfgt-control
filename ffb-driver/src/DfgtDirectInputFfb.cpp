@@ -20,6 +20,8 @@
 #include "../shared/BrokerProtocol.h"
 #include "../shared/BoundedIo.h"
 #include "../shared/EffectTiming.h"
+#include "../shared/WireCodec.h"
+#include "../shared/PipePeerValidation.h"
 
 // {806A045D-E7E8-491E-A607-31495A7BF4A3}
 static constexpr GUID CLSID_DfgtDirectInputFfb{
@@ -136,6 +138,20 @@ public:
                 FILE_FLAG_OVERLAPPED,
                 nullptr);
             if (pipe_ == INVALID_HANDLE_VALUE) return HRESULT_FROM_WIN32(GetLastError());
+            HMODULE providerModule = nullptr;
+            if (!GetModuleHandleExW(
+                    GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                    reinterpret_cast<LPCWSTR>(&g_objects),
+                    &providerModule) ||
+                !dfgt::ipc::ValidatePipeServer(
+                    pipe_,
+                    providerModule,
+                    L"DfgtFfbBroker.exe")) {
+                CloseHandle(pipe_);
+                pipe_ = INVALID_HANDLE_VALUE;
+                return E_ACCESSDENIED;
+            }
             DWORD mode = PIPE_READMODE_MESSAGE;
             if (!SetNamedPipeHandleState(pipe_, &mode, nullptr, nullptr)) {
                 const auto result = HRESULT_FROM_WIN32(GetLastError());
@@ -167,6 +183,8 @@ public:
         SendLocked(message);
         CloseHandle(pipe_);
         pipe_ = INVALID_HANDLE_VALUE;
+        sessionNonce_ = 0;
+        connected_ = false;
     }
 
     HRESULT Constant(
@@ -271,19 +289,42 @@ private:
     HRESULT SendLocked(dfgt::ipc::Message& message) noexcept {
         if (pipe_ == INVALID_HANDLE_VALUE) return DIERR_NOTINITIALIZED;
         message.sequence = ++sequence_;
+        message.capabilities = dfgt::ipc::RequiredCapabilities;
+        message.buildId = dfgt::ipc::BuildId;
+        message.sessionNonce =
+            message.command == dfgt::ipc::Command::Open
+            ? 0
+            : sessionNonce_;
+        const auto encoded = dfgt::ipc::wire::Encode(message);
         const auto write = dfgt::io::WriteExact(
-            pipe_, &message, sizeof(message), kPipeIoTimeoutMs);
-        if (!write.Succeeded(sizeof(message))) return write.result;
+            pipe_, encoded.data(),
+            static_cast<DWORD>(encoded.size()),
+            kPipeIoTimeoutMs);
+        if (!write.Succeeded(
+                static_cast<DWORD>(encoded.size()))) {
+            return write.result;
+        }
 
         dfgt::ipc::Response response{};
+        dfgt::ipc::wire::EncodedResponse encodedResponse{};
         const auto read = dfgt::io::ReadExact(
-            pipe_, &response, sizeof(response), kPipeIoTimeoutMs);
-        if (!read.Succeeded(sizeof(response))) return read.result;
-        if (response.magic != dfgt::ipc::Magic ||
-            response.version != dfgt::ipc::Version ||
-            response.size != sizeof(response) ||
+            pipe_, encodedResponse.data(),
+            static_cast<DWORD>(encodedResponse.size()),
+            kPipeIoTimeoutMs);
+        if (!read.Succeeded(
+                static_cast<DWORD>(encodedResponse.size()))) {
+            return read.result;
+        }
+        if (!dfgt::ipc::wire::Decode(
+                encodedResponse, response) ||
             response.sequence != message.sequence) {
             return E_FAIL;
+        }
+        if (message.command == dfgt::ipc::Command::Open) {
+            if (response.sessionNonce == 0) return E_ACCESSDENIED;
+            sessionNonce_ = response.sessionNonce;
+        } else if (response.sessionNonce != sessionNonce_) {
+            return E_ACCESSDENIED;
         }
         safetyMode_.store(
             response.safetyMode, std::memory_order_release);
@@ -315,6 +356,7 @@ private:
             dfgt::ipc::SafetyMode::Disconnected)};
     std::atomic<bool> connected_{false};
     std::uint32_t sequence_{};
+    std::uint64_t sessionNonce_{};
     std::condition_variable heartbeatWake_;
     std::jthread heartbeat_;
 };

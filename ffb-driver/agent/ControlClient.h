@@ -33,6 +33,7 @@ private:
 
     HANDLE pipe_{INVALID_HANDLE_VALUE};
     std::uint32_t sequence_{0};
+    std::uint64_t sessionNonce_{0};
 };
 
 } // namespace dfgt::agent

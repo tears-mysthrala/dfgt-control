@@ -184,6 +184,29 @@ set_target_properties(DfgtEffectTimingTests PROPERTIES
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 add_test(NAME effect-timing COMMAND DfgtEffectTimingTests)
 
+add_executable(DfgtBrokerProtocolIntegrationTests
+    tests/BrokerProtocolIntegrationTests.cpp)
+target_compile_features(
+    DfgtBrokerProtocolIntegrationTests PRIVATE cxx_std_20)
+target_compile_definitions(
+    DfgtBrokerProtocolIntegrationTests PRIVATE
+    UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_compile_options(
+    DfgtBrokerProtocolIntegrationTests PRIVATE
+    /W4 /WX /permissive- /guard:cf)
+target_link_options(
+    DfgtBrokerProtocolIntegrationTests PRIVATE
+    /guard:cf /DYNAMICBASE /NXCOMPAT)
+set_target_properties(
+    DfgtBrokerProtocolIntegrationTests PROPERTIES
+    MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+add_test(
+    NAME broker-framing-integration
+    COMMAND DfgtBrokerProtocolIntegrationTests
+        $<TARGET_FILE:DfgtFfbBroker>)
+set_tests_properties(
+    broker-framing-integration PROPERTIES RUN_SERIAL TRUE)
+
 add_executable(DfgtBrokerRangeSmoke tests/BrokerRangeSmoke.cpp)
 target_compile_features(DfgtBrokerRangeSmoke PRIVATE cxx_std_20)
 target_compile_definitions(DfgtBrokerRangeSmoke PRIVATE
