@@ -55,7 +55,7 @@ protocols.
 
    ```powershell
    .\scripts\Install-DfgtFfb.ps1 `
-     -ExpectedVersion '0.1.0-beta-local2' `
+     -ExpectedVersion '0.1.0-beta-local3' `
      -TargetUserSid ([Security.Principal.WindowsIdentity]::GetCurrent().User.Value) `
      -TargetUserProfile ([Environment]::GetFolderPath('UserProfile')) `
      -Confirm:$false

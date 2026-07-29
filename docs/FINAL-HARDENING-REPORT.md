@@ -44,6 +44,7 @@ arrival/removal, suspend/resume and schema-3 restore matrix in
 - `7253904` clear MSVC static analysis findings
 - `85849da` record beta hardening release decision
 - `4f0feb4` make packaged validation executable
+- `8a09f56` verify release provenance and live safety evidence
 
 ## Automated results
 
@@ -55,7 +56,7 @@ arrival/removal, suspend/resume and schema-3 restore matrix in
 - Mitigations: ASLR, NX and Control Flow Guard present in x64/x86; x64 also
   reports high-entropy VA.
 - Package:
-  `DfgtControl-v0.1.0-beta-local2-win.zip`
+  `DfgtControl-v0.1.0-beta-local3-win.zip`
 - The generated `.sha256` and `release-manifest.json` are authoritative for
   the final package digest and embedded commit.
 
