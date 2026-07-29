@@ -140,18 +140,36 @@ private:
     }
 
     bool InitialiseControl() {
-        if (!ReloadProfiles()) {
-            store_.QuarantineInvalid();
+        const auto loadResult = ReloadProfiles();
+        if (loadResult != dfgt::agent::ProfileLoadResult::Loaded) {
+            if (loadResult == dfgt::agent::ProfileLoadResult::InvalidJson ||
+                loadResult == dfgt::agent::ProfileLoadResult::InvalidData) {
+                store_.QuarantineInvalid();
+            } else if (
+                loadResult != dfgt::agent::ProfileLoadResult::Missing) {
+                UpdateTray(
+                    L"DFGT Control · perfiles no disponibles; "
+                    L"fichero preservado");
+                return false;
+            }
             profiles_.push_back(
                 dfgt::agent::ProfileStore::DesktopProfile());
-            store_.Save(profiles_);
+            if (!store_.Save(profiles_)) {
+                UpdateTray(
+                    L"DFGT Control · no se pudieron crear los perfiles");
+                return false;
+            }
         }
         return ConnectDevice();
     }
 
-    bool ReloadProfiles() {
+    dfgt::agent::ProfileLoadResult ReloadProfiles() {
         std::vector<dfgt::agent::ProfileModel> loaded;
-        if (!store_.Load(loaded) || loaded.empty()) return false;
+        const auto result = store_.Load(loaded);
+        if (result != dfgt::agent::ProfileLoadResult::Loaded ||
+            loaded.empty()) {
+            return result;
+        }
         profiles_ = std::move(loaded);
         WIN32_FILE_ATTRIBUTE_DATA attributes{};
         if (GetFileAttributesExW(
@@ -160,7 +178,7 @@ private:
                 &attributes)) {
             profileWriteTime_ = attributes.ftLastWriteTime;
         }
-        return true;
+        return dfgt::agent::ProfileLoadResult::Loaded;
     }
 
     bool ConnectDevice() {
@@ -187,7 +205,8 @@ private:
             CompareFileTime(
                 &attributes.ftLastWriteTime,
                 &profileWriteTime_) != 0 &&
-            ReloadProfiles()) {
+            ReloadProfiles() ==
+                dfgt::agent::ProfileLoadResult::Loaded) {
             activeProfile_.clear();
             ApplyForegroundProfile();
         }

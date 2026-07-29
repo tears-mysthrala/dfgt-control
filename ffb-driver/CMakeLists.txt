@@ -252,3 +252,21 @@ target_link_libraries(DfgtAgent PRIVATE
     windowsapp)
 set_target_properties(DfgtAgent PROPERTIES
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
+add_executable(DfgtProfileValidationTests
+    tests/ProfileValidationTests.cpp
+    agent/ProfileStore.cpp)
+target_compile_features(DfgtProfileValidationTests PRIVATE cxx_std_20)
+target_compile_definitions(DfgtProfileValidationTests PRIVATE
+    UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_compile_options(DfgtProfileValidationTests PRIVATE
+    /W4 /WX /permissive- /guard:cf)
+target_link_options(DfgtProfileValidationTests PRIVATE
+    /guard:cf /DYNAMICBASE /NXCOMPAT)
+target_link_libraries(DfgtProfileValidationTests PRIVATE
+    shell32 windowsapp)
+set_target_properties(DfgtProfileValidationTests PROPERTIES
+    MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+add_test(
+    NAME profile-document-validation
+    COMMAND DfgtProfileValidationTests)
