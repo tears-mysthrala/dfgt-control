@@ -54,7 +54,10 @@ protocols.
 6. Install DFGT Control:
 
    ```powershell
-   .\scripts\Install-DfgtFfb.ps1 -Confirm:$false
+   .\scripts\Install-DfgtFfb.ps1 `
+     -TargetUserSid ([Security.Principal.WindowsIdentity]::GetCurrent().User.Value) `
+     -TargetUserProfile ([Environment]::GetFolderPath('UserProfile')) `
+     -Confirm:$false
    ```
 
 7. Follow [the migration guide](docs/MIGRATION.md) before removing Logitech

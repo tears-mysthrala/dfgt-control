@@ -1,7 +1,13 @@
 [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
 param(
     [string]$InstallRoot = (Join-Path $env:ProgramFiles 'DfgtControl'),
-    [string]$BackupRoot = (Join-Path $env:ProgramData 'DfgtControl\backups')
+    [string]$BackupRoot = (Join-Path $env:ProgramData 'DfgtControl\backups'),
+
+    [Parameter(Mandatory)]
+    [string]$TargetUserSid,
+
+    [Parameter(Mandatory)]
+    [string]$TargetUserProfile
 )
 
 $ErrorActionPreference = 'Stop'
@@ -11,6 +17,17 @@ $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = [Security.Principal.WindowsPrincipal]::new($identity)
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     throw 'Run the installer from an elevated PowerShell process.'
+}
+if ($TargetUserSid -notmatch '^S-1-5-21-(?:[0-9]+-){3}[0-9]+$') {
+    throw 'TargetUserSid is not an allowlisted interactive user SID.'
+}
+$resolvedUserProfile = [IO.Path]::GetFullPath($TargetUserProfile).TrimEnd('\')
+$userHive = "Registry::HKEY_USERS\$TargetUserSid"
+if (-not (Test-Path -LiteralPath $userHive)) {
+    throw "Target user hive is not loaded: $TargetUserSid"
+}
+if (-not (Test-Path -LiteralPath $resolvedUserProfile -PathType Container)) {
+    throw "Target user profile does not exist: $resolvedUserProfile"
 }
 
 $driverRoot = Split-Path -Parent $PSScriptRoot
@@ -49,11 +66,11 @@ foreach ($artifact in @($provider64, $provider32, $broker, $agent, $ui)) {
 $clsid = '{806A045D-E7E8-491E-A607-31495A7BF4A3}'
 $oemRoot = 'HKLM:\SYSTEM\CurrentControlSet\Control\MediaProperties\PrivateProperties\Joystick\OEM\VID_046D&PID_C29A'
 $ffRoot = Join-Path $oemRoot 'OEMForceFeedback'
-$userOemRoot = 'HKCU:\SYSTEM\CurrentControlSet\Control\MediaProperties\PrivateProperties\Joystick\OEM\VID_046D&PID_C29A'
+$userOemRoot = "$userHive\SYSTEM\CurrentControlSet\Control\MediaProperties\PrivateProperties\Joystick\OEM\VID_046D&PID_C29A"
 $userFfRoot = Join-Path $userOemRoot 'OEMForceFeedback'
 $class64 = "HKLM:\SOFTWARE\Classes\CLSID\$clsid"
 $class32 = "HKLM:\SOFTWARE\Classes\WOW6432Node\CLSID\$clsid"
-$runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+$runKey = "$userHive\Software\Microsoft\Windows\CurrentVersion\Run"
 $legacyRunName = 'DfgtFfbBroker'
 $runName = 'DfgtControlAgent'
 
@@ -118,7 +135,7 @@ if ($PSCmdlet.ShouldProcess($InstallRoot, 'Install DFGT user-mode FFB stack and 
         if ($LASTEXITCODE -ne 0) { throw 'Could not back up the DFGT OEM registry branch.' }
     }
     if (Test-Path -LiteralPath $userOemRoot) {
-        & reg.exe export 'HKCU\SYSTEM\CurrentControlSet\Control\MediaProperties\PrivateProperties\Joystick\OEM\VID_046D&PID_C29A' (Join-Path $backup 'oem-user-before.reg') /y | Out-Null
+        & reg.exe export "HKEY_USERS\$TargetUserSid\SYSTEM\CurrentControlSet\Control\MediaProperties\PrivateProperties\Joystick\OEM\VID_046D&PID_C29A" (Join-Path $backup 'oem-user-before.reg') /y | Out-Null
         if ($LASTEXITCODE -ne 0) {
             throw 'Could not back up the per-user DFGT OEM registry branch.'
         }
@@ -188,7 +205,9 @@ if ($PSCmdlet.ShouldProcess($InstallRoot, 'Install DFGT user-mode FFB stack and 
     New-ItemProperty -LiteralPath $runKey -Name $runName `
         -Value "`"$installedAgent`"" -PropertyType String -Force | Out-Null
 
-    $programs = [Environment]::GetFolderPath('Programs')
+    $programs = Join-Path $resolvedUserProfile `
+        'AppData\Roaming\Microsoft\Windows\Start Menu\Programs'
+    New-Item -ItemType Directory -Path $programs -Force | Out-Null
     $shortcutPath = Join-Path $programs 'DFGT Control.lnk'
     $shell = New-Object -ComObject WScript.Shell
     $shortcut = $shell.CreateShortcut($shortcutPath)
@@ -200,6 +219,8 @@ if ($PSCmdlet.ShouldProcess($InstallRoot, 'Install DFGT user-mode FFB stack and 
     $manifest = [ordered]@{
         installedAt = (Get-Date).ToString('o')
         installedBy = $identity.Name
+        targetUserSid = $TargetUserSid
+        targetUserProfile = $resolvedUserProfile
         installRoot = $InstallRoot
         backup = $backup
         providerClsid = $clsid

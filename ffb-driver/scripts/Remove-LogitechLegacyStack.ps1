@@ -112,7 +112,10 @@ if ($PSCmdlet.ShouldProcess(
     if ($LASTEXITCODE -ne 0) { throw 'PnP device rescan failed.' }
 
     & (Join-Path $PSScriptRoot 'Install-DfgtFfb.ps1') `
-        -InstallRoot $resolvedInstall -Confirm:$false
+        -InstallRoot $resolvedInstall `
+        -TargetUserSid ([string]$snapshot.accountSid) `
+        -TargetUserProfile ([string]$snapshot.userProfile) `
+        -Confirm:$false
     if ($LASTEXITCODE -ne 0) {
         throw 'Replacement registration repair failed.'
     }

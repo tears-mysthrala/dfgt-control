@@ -131,6 +131,7 @@ $snapshot = [ordered]@{
     computer = $env:COMPUTERNAME
     account = $identity.Name
     accountSid = $identity.User.Value
+    userProfile = [Environment]::GetFolderPath('UserProfile')
     machineGuid = $machineGuid
     windowsBuild = $windowsBuild
     backupDirectory = $backup

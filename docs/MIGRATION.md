@@ -14,7 +14,10 @@ system operation.
 ```powershell
 $backup = .\scripts\Backup-LogitechLegacyStack.ps1 |
   ConvertFrom-Json
-.\scripts\Install-DfgtFfb.ps1 -Confirm:$false
+.\scripts\Install-DfgtFfb.ps1 `
+  -TargetUserSid $backup.accountSid `
+  -TargetUserProfile $backup.userProfile `
+  -Confirm:$false
 ```
 
 Test input and force feedback before removing anything.

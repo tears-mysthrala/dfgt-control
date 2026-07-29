@@ -14,10 +14,8 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 
 $clsid = '{806A045D-E7E8-491E-A607-31495A7BF4A3}'
 $ffRoot = 'HKLM:\SYSTEM\CurrentControlSet\Control\MediaProperties\PrivateProperties\Joystick\OEM\VID_046D&PID_C29A\OEMForceFeedback'
-$userFfRoot = 'HKCU:\SYSTEM\CurrentControlSet\Control\MediaProperties\PrivateProperties\Joystick\OEM\VID_046D&PID_C29A\OEMForceFeedback'
 $class64 = "HKLM:\SOFTWARE\Classes\CLSID\$clsid"
 $class32 = "HKLM:\SOFTWARE\Classes\WOW6432Node\CLSID\$clsid"
-$runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $runNames = @('DfgtFfbBroker', 'DfgtControlAgent')
 $manifestPath = Join-Path $InstallRoot 'install-manifest.json'
 
@@ -31,6 +29,19 @@ if ($resolvedInstallRoot -ne $manifestRoot -or
     [IO.Path]::GetFileName($resolvedInstallRoot) -ne 'DfgtControl') {
     throw "Refusing cleanup of an unexpected install root: $resolvedInstallRoot"
 }
+if ([string]$manifest.targetUserSid -notmatch
+        '^S-1-5-21-(?:[0-9]+-){3}[0-9]+$') {
+    throw 'Install manifest has no valid target user SID.'
+}
+$targetUserSid = [string]$manifest.targetUserSid
+$targetUserProfile = [IO.Path]::GetFullPath(
+    [string]$manifest.targetUserProfile).TrimEnd('\')
+$userHive = "Registry::HKEY_USERS\$targetUserSid"
+if (-not (Test-Path -LiteralPath $userHive)) {
+    throw "Target user hive is not loaded: $targetUserSid"
+}
+$userFfRoot = "$userHive\SYSTEM\CurrentControlSet\Control\MediaProperties\PrivateProperties\Joystick\OEM\VID_046D&PID_C29A\OEMForceFeedback"
+$runKey = "$userHive\Software\Microsoft\Windows\CurrentVersion\Run"
 
 $ownedFiles = @(
     foreach ($file in $manifest.files) {
@@ -83,13 +94,29 @@ if ($PSCmdlet.ShouldProcess($resolvedInstallRoot, 'Remove DFGT user-mode FFB sta
 
     if (Test-Path -LiteralPath $runKey) {
         foreach ($runName in $runNames) {
-            Remove-ItemProperty -LiteralPath $runKey -Name $runName `
-                -ErrorAction SilentlyContinue
+            $runValue = (Get-ItemProperty -LiteralPath $runKey `
+                -Name $runName -ErrorAction SilentlyContinue).$runName
+            if ($runValue) {
+                $candidate = ([string]$runValue).Trim().Trim('"')
+                if ([IO.Path]::GetFullPath($candidate).StartsWith(
+                        "$resolvedInstallRoot\",
+                        [StringComparison]::OrdinalIgnoreCase)) {
+                    Remove-ItemProperty -LiteralPath $runKey -Name $runName
+                }
+            }
         }
     }
-    $shortcutPath = Join-Path `
-        ([Environment]::GetFolderPath('Programs')) 'DFGT Control.lnk'
-    Remove-Item -LiteralPath $shortcutPath -Force -ErrorAction SilentlyContinue
+    $shortcutPath = Join-Path $targetUserProfile `
+        'AppData\Roaming\Microsoft\Windows\Start Menu\Programs\DFGT Control.lnk'
+    if (Test-Path -LiteralPath $shortcutPath -PathType Leaf) {
+        $shell = New-Object -ComObject WScript.Shell
+        $shortcut = $shell.CreateShortcut($shortcutPath)
+        if ([IO.Path]::GetFullPath($shortcut.TargetPath) -eq
+            [IO.Path]::GetFullPath(
+                (Join-Path $resolvedInstallRoot 'bin\x64\DfgtControl.exe'))) {
+            Remove-Item -LiteralPath $shortcutPath -Force
+        }
+    }
 
     Remove-OwnedForceFeedbackRoot -Path $ffRoot
     Remove-OwnedForceFeedbackRoot -Path $userFfRoot
