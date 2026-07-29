@@ -240,6 +240,15 @@ public:
         renderEpoch_.store(epoch, std::memory_order_release);
     }
 
+    [[nodiscard]] dfgt::ipc::SafetyMode SafetyMode() const noexcept {
+        return static_cast<dfgt::ipc::SafetyMode>(
+            safetyMode_.load(std::memory_order_acquire));
+    }
+
+    [[nodiscard]] bool BrokerConnected() const noexcept {
+        return connected_.load(std::memory_order_acquire);
+    }
+
 private:
     static constexpr std::uint32_t kSoftwareSlot = 1u << 0;
     static constexpr std::uint32_t kSpringSlot = 1u << 1;
@@ -276,6 +285,10 @@ private:
             response.sequence != message.sequence) {
             return E_FAIL;
         }
+        safetyMode_.store(
+            response.safetyMode, std::memory_order_release);
+        connected_.store(
+            response.connected != 0, std::memory_order_release);
         return response.result;
     }
 
@@ -297,6 +310,10 @@ private:
     std::mutex mutex_;
     std::atomic<std::uint32_t> activeSlots_{0};
     std::atomic<std::uint64_t> renderEpoch_{0};
+    std::atomic<std::uint32_t> safetyMode_{
+        static_cast<std::uint32_t>(
+            dfgt::ipc::SafetyMode::Disconnected)};
+    std::atomic<bool> connected_{false};
     std::uint32_t sequence_{};
     std::condition_variable heartbeatWake_;
     std::jthread heartbeat_;
@@ -483,10 +500,23 @@ public:
         std::scoped_lock lock(stateMutex_);
         state->dwState = 0;
         if (paused_) state->dwState |= DIGFFS_PAUSED;
-        if (actuatorsEnabled_) state->dwState |= DIGFFS_ACTUATORSON;
-        else state->dwState |= DIGFFS_ACTUATORSOFF;
-        state->dwState |= DIGFFS_POWERON | DIGFFS_SAFETYSWITCHOFF | DIGFFS_USERFFSWITCHON;
-        state->dwLoad = std::min<DWORD>(100, static_cast<DWORD>(effects_.size()) * 6);
+        const auto safetyMode = transport_.SafetyMode();
+        const auto safeAndConnected =
+            transport_.BrokerConnected() &&
+            (safetyMode == dfgt::ipc::SafetyMode::Armed ||
+             safetyMode == dfgt::ipc::SafetyMode::Active);
+        if (actuatorsEnabled_ && safeAndConnected) {
+            state->dwState |=
+                DIGFFS_ACTUATORSON | DIGFFS_POWERON |
+                DIGFFS_SAFETYSWITCHOFF |
+                DIGFFS_USERFFSWITCHON;
+        } else {
+            state->dwState |= DIGFFS_ACTUATORSOFF;
+        }
+        state->dwLoad = static_cast<DWORD>(
+            std::min<std::size_t>(
+                100,
+                effects_.size() * 100 / kMaximumEffects));
         return S_OK;
     }
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstddef>
 
 namespace dfgt::ipc {
 
@@ -11,6 +12,18 @@ inline constexpr wchar_t ControlPipeName[] =
 inline constexpr std::uint32_t Magic = 0x54474644; // "DFGT" little-endian
 inline constexpr std::uint16_t Version = 3;
 inline constexpr std::size_t DevicePathCharacters = 512;
+
+enum class SafetyMode : std::uint32_t {
+    Disconnected = 0,
+    Initializing,
+    ReadyDisarmed,
+    Armed,
+    Active,
+    EmergencyLatched,
+    StopUnconfirmed,
+    Faulted,
+    MaintenanceSafe,
+};
 
 enum class Command : std::uint32_t {
     Open = 1,
@@ -47,10 +60,14 @@ struct Response {
     std::uint16_t size{sizeof(Response)};
     std::uint32_t sequence{};
     std::int32_t result{};
+    std::uint32_t safetyMode{};
+    std::uint32_t activeSlots{};
+    std::uint32_t connected{};
+    std::uint32_t stopConfirmed{};
 };
 
 static_assert(sizeof(Message) <= 4096);
-static_assert(sizeof(Response) == 16);
+static_assert(sizeof(Response) == 32);
 
 namespace control {
 

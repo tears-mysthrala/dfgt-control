@@ -901,10 +901,29 @@ HRESULT ProcessMessage(
     }
 }
 
-bool WriteResponse(HANDLE pipe, std::uint32_t sequence, HRESULT result) {
+bool WriteResponse(
+    HANDLE pipe,
+    std::uint32_t sequence,
+    HRESULT result,
+    BrokerState& state) {
     dfgt::ipc::Response response{};
     response.sequence = sequence;
     response.result = result;
+    {
+        std::scoped_lock lock(state.stateMutex);
+        response.safetyMode =
+            static_cast<std::uint32_t>(state.safety.Mode());
+        response.activeSlots =
+            static_cast<std::uint32_t>(
+                state.safety.ActiveSlots());
+        response.connected =
+            state.safety.Mode() !=
+                dfgt::broker::SafetyMode::Disconnected
+            ? 1u
+            : 0u;
+        response.stopConfirmed =
+            state.safety.StopConfirmed() ? 1u : 0u;
+    }
     const auto write = dfgt::io::WriteExact(
         pipe, &response, sizeof(response), kPipeIoTimeoutMs);
     return write.Succeeded(sizeof(response));
@@ -1109,7 +1128,8 @@ int RunClient(
         } else if (!forceActive) {
             leaseDeadline = GetTickCount64() + kReadTimeoutMs;
         }
-        if (!WriteResponse(pipe, message.sequence, result)) {
+        if (!WriteResponse(
+                pipe, message.sequence, result, state)) {
             HRESULT stopResult = S_OK;
             {
                 std::scoped_lock lock(state.deviceMutex);

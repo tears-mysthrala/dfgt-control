@@ -107,6 +107,15 @@ int wmain(int argc, wchar_t** argv) {
         0, second, DIES_SOLO | 0x100, 1) ==
         DIERR_INVALIDPARAM, "invalid start mode");
 
+    DIDEVICESTATE deviceState{};
+    deviceState.dwSize = sizeof(deviceState);
+    check(SUCCEEDED(driver->GetForceFeedbackState(
+        0, &deviceState)), "GetForceFeedbackState");
+    check(
+        (deviceState.dwState &
+            (DIGFFS_POWERON | DIGFFS_ACTUATORSON)) == 0,
+        "disconnected provider claimed powered actuators");
+
     DICONDITION condition{};
     condition.lPositiveCoefficient = 1000;
     condition.lNegativeCoefficient = -1000;

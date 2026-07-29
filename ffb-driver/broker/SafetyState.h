@@ -3,6 +3,7 @@
 #include <windows.h>
 
 #include <cstdint>
+#include "../shared/BrokerProtocol.h"
 
 namespace dfgt::broker {
 
@@ -15,17 +16,7 @@ inline constexpr HRESULT DFGT_E_NOT_ARMED =
 inline constexpr HRESULT DFGT_E_TRANSPORT_FAULTED =
     MAKE_HRESULT(SEVERITY_ERROR, FACILITY_ITF, 0x204);
 
-enum class SafetyMode : std::uint32_t {
-    Disconnected = 0,
-    Initializing,
-    ReadyDisarmed,
-    Armed,
-    Active,
-    EmergencyLatched,
-    StopUnconfirmed,
-    Faulted,
-    MaintenanceSafe,
-};
+using SafetyMode = dfgt::ipc::SafetyMode;
 
 enum class PhysicalSlot : std::uint32_t {
     None = 0,
