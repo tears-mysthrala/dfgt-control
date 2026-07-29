@@ -139,8 +139,13 @@ if ($PSCmdlet.ShouldProcess($resolvedInstallRoot, 'Remove DFGT user-mode FFB sta
 
     if (Test-Path -LiteralPath $runKey) {
         foreach ($runName in $runNames) {
-            $runValue = (Get-ItemProperty -LiteralPath $runKey `
-                -Name $runName -ErrorAction SilentlyContinue).$runName
+            $runProperties = Get-ItemProperty -LiteralPath $runKey `
+                -Name $runName -ErrorAction SilentlyContinue
+            $runValue = if ($runProperties -and
+                $runProperties.PSObject.Properties[$runName]) {
+                $runProperties.$runName
+            }
+            else { $null }
             if ($runValue) {
                 $candidate = ([string]$runValue).Trim().Trim('"')
                 if ([IO.Path]::GetFullPath($candidate).StartsWith(
