@@ -79,6 +79,14 @@ HRESULT ControlClient::EmergencyStop() noexcept {
     return Exchange(request, response);
 }
 
+HRESULT ControlClient::AcknowledgeAndRearm() noexcept {
+    dfgt::ipc::control::Request request{};
+    dfgt::ipc::control::Response response{};
+    request.command =
+        dfgt::ipc::control::Command::AcknowledgeAndRearm;
+    return Exchange(request, response);
+}
+
 HRESULT ControlClient::DetachDevice() noexcept {
     dfgt::ipc::control::Request request{};
     dfgt::ipc::control::Response response{};

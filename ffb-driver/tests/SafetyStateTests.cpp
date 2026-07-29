@@ -62,6 +62,13 @@ int main() {
     ok &= Expect(
         failedStop.LastSafetyError() == E_FAIL,
         "last safety error was lost");
+    failedStop.ConfirmAllStopped();
+    ok &= Expect(
+        failedStop.Mode() == SafetyMode::EmergencyLatched,
+        "recovered stop lost emergency latch");
+    ok &= Expect(
+        SUCCEEDED(failedStop.AcknowledgeAndRearm(true, true)),
+        "recovered stop could not be explicitly rearmed");
 
     SafetyState slots;
     slots.BeginInitialize();

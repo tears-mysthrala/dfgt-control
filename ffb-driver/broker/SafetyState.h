@@ -142,8 +142,8 @@ public:
     }
 
     HRESULT LatchEmergency() noexcept {
-        const auto alreadyLatched =
-            mode_ == SafetyMode::EmergencyLatched;
+        const auto alreadyLatched = emergencyRequested_;
+        emergencyRequested_ = true;
         mode_ = SafetyMode::EmergencyLatched;
         stopConfirmed_ = false;
         if (alreadyLatched) return S_FALSE;
@@ -153,7 +153,9 @@ public:
     void ConfirmAllStopped() noexcept {
         activeSlots_ = PhysicalSlot::None;
         stopConfirmed_ = true;
-        if (mode_ != SafetyMode::EmergencyLatched) {
+        if (emergencyRequested_) {
+            mode_ = SafetyMode::EmergencyLatched;
+        } else {
             mode_ = SafetyMode::ReadyDisarmed;
         }
     }
@@ -180,6 +182,7 @@ public:
             return DFGT_E_TRANSPORT_FAULTED;
         }
         lastSafetyError_ = S_OK;
+        emergencyRequested_ = false;
         mode_ = SafetyMode::Armed;
         return S_OK;
     }
@@ -199,6 +202,7 @@ private:
     PhysicalSlot activeSlots_{PhysicalSlot::None};
     HRESULT lastSafetyError_{S_OK};
     bool stopConfirmed_{};
+    bool emergencyRequested_{};
 };
 
 } // namespace dfgt::broker

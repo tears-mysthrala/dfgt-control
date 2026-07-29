@@ -22,6 +22,7 @@ constexpr UINT_PTR kMaintenanceTimer = 2;
 constexpr UINT kMenuOpen = 1001;
 constexpr UINT kMenuEmergencyStop = 1002;
 constexpr UINT kMenuExit = 1003;
+constexpr UINT kMenuRearm = 1004;
 constexpr wchar_t kWindowClass[] = L"DfgtControl.Agent.Window";
 
 std::wstring ModuleDirectory() {
@@ -282,6 +283,11 @@ private:
             MF_STRING,
             kMenuEmergencyStop,
             L"Parada de emergencia");
+        AppendMenuW(
+            menu,
+            MF_STRING,
+            kMenuRearm,
+            L"Confirmar y rearmar");
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(menu, MF_STRING, kMenuExit, L"Salir");
         SetForegroundWindow(window_);
@@ -347,8 +353,29 @@ private:
                 OpenUserInterface();
                 break;
             case kMenuEmergencyStop:
-                control_.EmergencyStop();
-                UpdateTray(L"DFGT Control · fuerza detenida");
+                if (SUCCEEDED(control_.EmergencyStop())) {
+                    UpdateTray(
+                        L"DFGT Control · PARADA ENCLAVADA");
+                } else {
+                    UpdateTray(
+                        L"DFGT Control · PARADA NO CONFIRMADA: "
+                        L"DESCONECTA EL VOLANTE");
+                }
+                break;
+            case kMenuRearm:
+                if (MessageBoxW(
+                        window_,
+                        L"Confirma que el volante está libre y que deseas "
+                        L"rearmar el force feedback.",
+                        L"Rearmar DFGT",
+                        MB_ICONWARNING | MB_OKCANCEL |
+                            MB_DEFBUTTON2) == IDOK) {
+                    const auto result =
+                        control_.AcknowledgeAndRearm();
+                    UpdateTray(SUCCEEDED(result)
+                        ? L"DFGT Control · rearmado"
+                        : L"DFGT Control · rearme rechazado");
+                }
                 break;
             case kMenuExit:
                 PostQuitMessage(0);

@@ -21,6 +21,7 @@ public:
     HRESULT ApplyProfile(
         const dfgt::ipc::control::Profile& profile) noexcept;
     HRESULT EmergencyStop() noexcept;
+    HRESULT AcknowledgeAndRearm() noexcept;
     HRESULT DetachDevice() noexcept;
     HRESULT GetStatus(
         dfgt::ipc::control::Status& status) noexcept;

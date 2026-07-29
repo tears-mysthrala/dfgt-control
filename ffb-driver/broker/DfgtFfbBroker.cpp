@@ -945,13 +945,16 @@ HRESULT ProcessControlRequest(
         break;
     case Command::EmergencyStop:
         // Latch and invalidate the current FFB session before touching HID.
-        state.safety.LatchEmergency();
-        ++state.safetyGeneration;
-        result = state.device.StopAll();
-        if (SUCCEEDED(result)) {
-            state.safety.ConfirmAllStopped();
-        } else {
-            state.safety.MarkStopUnconfirmed(result);
+        {
+            const auto latchResult = state.safety.LatchEmergency();
+            ++state.safetyGeneration;
+            result = state.device.StopAll();
+            if (SUCCEEDED(result)) {
+                state.safety.ConfirmAllStopped();
+                result = latchResult;
+            } else {
+                state.safety.MarkStopUnconfirmed(result);
+            }
         }
         ++state.failSafeCount;
         break;
