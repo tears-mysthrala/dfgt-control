@@ -119,6 +119,12 @@ $effects = @(
 
 $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $backup = Join-Path $BackupRoot $timestamp
+$resolvedInstallRoot = [IO.Path]::GetFullPath($InstallRoot).TrimEnd('\')
+if ([IO.Path]::GetFileName($resolvedInstallRoot) -ne 'DfgtControl') {
+    throw "Refusing an unexpected install root: $resolvedInstallRoot"
+}
+$stagingRoot = "$resolvedInstallRoot.staging-$timestamp"
+$previousRoot = "$resolvedInstallRoot.previous-$timestamp"
 $bin64 = Join-Path $InstallRoot 'bin\x64'
 $bin32 = Join-Path $InstallRoot 'bin\x86'
 $installedProvider64 = Join-Path $bin64 'DfgtDirectInputFfb.dll'
@@ -128,7 +134,16 @@ $installedAgent = Join-Path $bin64 'DfgtAgent.exe'
 $installedUi = Join-Path $bin64 'DfgtControl.exe'
 
 if ($PSCmdlet.ShouldProcess($InstallRoot, 'Install DFGT user-mode FFB stack and registry')) {
-    New-Item -ItemType Directory -Path $backup, $bin64, $bin32 -Force | Out-Null
+    $swapped = $false
+    try {
+    if ((Test-Path -LiteralPath $stagingRoot) -or
+        (Test-Path -LiteralPath $previousRoot)) {
+        throw 'Staging or rollback path already exists; refusing ambiguous upgrade.'
+    }
+    $stageBin64 = Join-Path $stagingRoot 'bin\x64'
+    $stageBin32 = Join-Path $stagingRoot 'bin\x86'
+    New-Item -ItemType Directory -Path $backup, $stageBin64, $stageBin32 `
+        -Force | Out-Null
 
     if (Test-Path -LiteralPath $oemRoot) {
         & reg.exe export 'HKLM\SYSTEM\CurrentControlSet\Control\MediaProperties\PrivateProperties\Joystick\OEM\VID_046D&PID_C29A' (Join-Path $backup 'oem-before.reg') /y | Out-Null
@@ -141,11 +156,74 @@ if ($PSCmdlet.ShouldProcess($InstallRoot, 'Install DFGT user-mode FFB stack and 
         }
     }
 
-    Copy-Item -LiteralPath $provider64 -Destination $installedProvider64 -Force
-    Copy-Item -LiteralPath $provider32 -Destination $installedProvider32 -Force
-    Copy-Item -LiteralPath $broker -Destination $installedBroker -Force
-    Copy-Item -LiteralPath $agent -Destination $installedAgent -Force
-    Copy-Item -LiteralPath $ui -Destination $installedUi -Force
+    Copy-Item -LiteralPath $provider64 `
+        -Destination (Join-Path $stageBin64 'DfgtDirectInputFfb.dll')
+    Copy-Item -LiteralPath $provider32 `
+        -Destination (Join-Path $stageBin32 'DfgtDirectInputFfb.dll')
+    Copy-Item -LiteralPath $broker `
+        -Destination (Join-Path $stageBin64 'DfgtFfbBroker.exe')
+    Copy-Item -LiteralPath $agent `
+        -Destination (Join-Path $stageBin64 'DfgtAgent.exe')
+    Copy-Item -LiteralPath $ui `
+        -Destination (Join-Path $stageBin64 'DfgtControl.exe')
+
+    $isUpgrade = Test-Path -LiteralPath $resolvedInstallRoot -PathType Container
+    if ($isUpgrade) {
+        $oldManifest = Join-Path $resolvedInstallRoot 'install-manifest.json'
+        if (-not (Test-Path -LiteralPath $oldManifest -PathType Leaf)) {
+            throw 'Existing install has no ownership manifest; refusing upgrade.'
+        }
+        $oldOwnership = Get-Content -LiteralPath $oldManifest -Raw |
+            ConvertFrom-Json
+        if ([IO.Path]::GetFullPath(
+                [string]$oldOwnership.installRoot).TrimEnd('\') -ne
+            $resolvedInstallRoot) {
+            throw 'Existing ownership manifest targets another install root.'
+        }
+        $oldOwnedFiles = @(
+            foreach ($file in $oldOwnership.files) {
+                $candidate = [IO.Path]::GetFullPath([string]$file.path)
+                if (-not $candidate.StartsWith(
+                        "$resolvedInstallRoot\",
+                        [StringComparison]::OrdinalIgnoreCase)) {
+                    throw "Existing manifest escapes install root: $candidate"
+                }
+                $candidate
+            }
+        )
+        $unowned = @(
+            Get-ChildItem -LiteralPath $resolvedInstallRoot -File -Recurse |
+                Where-Object {
+                    $_.FullName -ne $oldManifest -and
+                    $_.FullName -notin $oldOwnedFiles
+                }
+        )
+        if ($unowned) {
+            throw "Upgrade would move unowned files: $($unowned.FullName -join ', ')"
+        }
+        $presentDfgt = @(
+            Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue |
+                Where-Object InstanceId -like '*VID_046D&PID_C29A*'
+        )
+        if ($presentDfgt) {
+            throw 'Disconnect the DFGT before upgrade. No process has been stopped.'
+        }
+        Get-CimInstance Win32_Process |
+            Where-Object {
+                $_.Name -in @(
+                    'DfgtFfbBroker.exe',
+                    'DfgtAgent.exe',
+                    'DfgtControl.exe') -and
+                $_.ExecutablePath -and
+                [IO.Path]::GetFullPath($_.ExecutablePath).StartsWith(
+                    "$resolvedInstallRoot\",
+                    [StringComparison]::OrdinalIgnoreCase)
+            } |
+            ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+        Move-Item -LiteralPath $resolvedInstallRoot -Destination $previousRoot
+    }
+    Move-Item -LiteralPath $stagingRoot -Destination $resolvedInstallRoot
+    $swapped = $true
 
     foreach ($class in @(
         @{ Path = $class64; Dll = $installedProvider64 },
@@ -242,6 +320,51 @@ if ($PSCmdlet.ShouldProcess($InstallRoot, 'Install DFGT user-mode FFB stack and 
         (Join-Path $InstallRoot 'install-manifest.json'),
         $manifestJson,
         [Text.UTF8Encoding]::new($false))
+    if (Test-Path -LiteralPath $previousRoot) {
+        Remove-Item -LiteralPath $previousRoot -Recurse -Force
+    }
+    }
+    catch {
+        $failure = $_
+        if ($swapped -and
+            (Test-Path -LiteralPath $resolvedInstallRoot)) {
+            Remove-Item -LiteralPath $resolvedInstallRoot -Recurse -Force
+        }
+        if (Test-Path -LiteralPath $previousRoot) {
+            Move-Item -LiteralPath $previousRoot `
+                -Destination $resolvedInstallRoot
+        }
+        foreach ($registryBackup in @(
+            (Join-Path $backup 'oem-before.reg'),
+            (Join-Path $backup 'oem-user-before.reg'))) {
+            if (Test-Path -LiteralPath $registryBackup -PathType Leaf) {
+                & reg.exe import $registryBackup | Out-Null
+            }
+        }
+        if (-not (Test-Path -LiteralPath $previousRoot) -and
+            -not (Test-Path -LiteralPath $resolvedInstallRoot)) {
+            foreach ($ownedRoot in @($ffRoot, $userFfRoot)) {
+                if (Test-Path -LiteralPath $ownedRoot) {
+                    $owner = (Get-ItemProperty -LiteralPath $ownedRoot `
+                        -Name CLSID -ErrorAction SilentlyContinue).CLSID
+                    if ($owner -eq $clsid) {
+                        Remove-Item -LiteralPath $ownedRoot -Recurse -Force
+                    }
+                }
+            }
+            foreach ($class in @($class64, $class32)) {
+                if (Test-Path -LiteralPath $class) {
+                    Remove-Item -LiteralPath $class -Recurse -Force
+                }
+            }
+        }
+        throw $failure
+    }
+    finally {
+        if (Test-Path -LiteralPath $stagingRoot) {
+            Remove-Item -LiteralPath $stagingRoot -Recurse -Force
+        }
+    }
 }
 
 [pscustomobject]@{
