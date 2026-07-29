@@ -1,5 +1,7 @@
 #include "../broker/SafetyState.h"
+#include "../broker/StopRecoveryPolicy.h"
 
+#include <chrono>
 #include <iostream>
 
 namespace {
@@ -14,6 +16,11 @@ bool Expect(bool condition, const char* message) {
 int main() {
     using namespace dfgt::broker;
     bool ok = true;
+    using namespace std::chrono_literals;
+    ok &= Expect(
+        dfgt::broker::StopRecoveryBackoff ==
+            std::array{100ms, 250ms, 500ms},
+        "stop recovery backoff is not bounded and deterministic");
 
     SafetyState emergency;
     emergency.BeginInitialize();

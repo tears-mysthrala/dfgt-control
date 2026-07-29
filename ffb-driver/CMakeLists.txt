@@ -138,6 +138,19 @@ set_target_properties(DfgtBoundedIoTests PROPERTIES
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 add_test(NAME bounded-pipe-io COMMAND DfgtBoundedIoTests)
 
+add_executable(DfgtEmergencyIoGateTests
+    tests/EmergencyIoGateTests.cpp)
+target_compile_features(DfgtEmergencyIoGateTests PRIVATE cxx_std_20)
+target_compile_definitions(DfgtEmergencyIoGateTests PRIVATE
+    UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_compile_options(DfgtEmergencyIoGateTests PRIVATE
+    /W4 /WX /permissive- /guard:cf)
+target_link_options(DfgtEmergencyIoGateTests PRIVATE
+    /guard:cf /DYNAMICBASE /NXCOMPAT)
+set_target_properties(DfgtEmergencyIoGateTests PROPERTIES
+    MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+add_test(NAME emergency-io-gate COMMAND DfgtEmergencyIoGateTests)
+
 add_executable(DfgtBrokerRangeSmoke tests/BrokerRangeSmoke.cpp)
 target_compile_features(DfgtBrokerRangeSmoke PRIVATE cxx_std_20)
 target_compile_definitions(DfgtBrokerRangeSmoke PRIVATE

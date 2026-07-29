@@ -23,6 +23,8 @@
 #include "EffectCoordinator.h"
 #include "LeaseWatchdog.h"
 #include "ClientProcessWatch.h"
+#include "EmergencyIoGate.h"
+#include "StopRecoveryPolicy.h"
 
 namespace {
 
@@ -479,7 +481,11 @@ private:
 };
 
 struct BrokerState final {
-    std::mutex mutex;
+    // Lock order: stateMutex is never held during OS I/O. deviceMutex only
+    // serializes access to HidDevice and must never be acquired while holding
+    // stateMutex.
+    std::mutex stateMutex;
+    std::timed_mutex deviceMutex;
     HidDevice device;
     bool ffbClientConnected{false};
     bool controlClientConnected{false};
@@ -487,7 +493,41 @@ struct BrokerState final {
     HRESULT lastResult{S_OK};
     dfgt::broker::SafetyState safety;
     std::atomic<std::uint64_t> safetyGeneration{0};
+    std::atomic<bool> stopRecoveryRequested{false};
 };
+
+void RunStopRecovery(
+    BrokerState& state,
+    std::stop_token stop) {
+    while (!stop.stop_requested()) {
+        if (!state.stopRecoveryRequested.exchange(false)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            continue;
+        }
+        for (const auto delay : dfgt::broker::StopRecoveryBackoff) {
+            std::this_thread::sleep_for(delay);
+            if (stop.stop_requested()) return;
+            HRESULT result = S_OK;
+            {
+                std::scoped_lock lock(state.deviceMutex);
+                result = state.device.StopAll();
+            }
+            {
+                std::scoped_lock lock(state.stateMutex);
+                state.lastResult = result;
+                if (SUCCEEDED(result)) {
+                    state.safety.ConfirmAllStopped();
+                } else {
+                    state.safety.MarkStopUnconfirmed(result);
+                }
+            }
+            if (SUCCEEDED(result)) {
+                state.stopRecoveryRequested = false;
+                break;
+            }
+        }
+    }
+}
 
 bool ReadMessageWithTimeout(
     HANDLE pipe,
@@ -503,14 +543,17 @@ bool ReadMessageWithTimeout(
         }
         HRESULT rangeLockResult = S_OK;
         {
-            std::scoped_lock lock(state.mutex);
+            std::scoped_lock lock(state.deviceMutex);
             rangeLockResult = state.device.PollRangeLock();
         }
         if (FAILED(rangeLockResult)) {
             {
-                std::scoped_lock lock(state.mutex);
+                std::scoped_lock lock(state.deviceMutex);
                 state.device.StopAll();
                 state.device.SetRange(900);
+            }
+            {
+                std::scoped_lock lock(state.stateMutex);
                 state.lastResult = rangeLockResult;
                 ++state.failSafeCount;
             }
@@ -526,8 +569,18 @@ bool ReadMessageWithTimeout(
         if (forceActive && GetTickCount64() >= leaseDeadline) {
             HRESULT result = S_OK;
             {
-                std::scoped_lock lock(state.mutex);
-                result = state.device.StopAll();
+                result = dfgt::broker::TryEmergencyIo(
+                    state.deviceMutex,
+                    std::chrono::milliseconds(5),
+                    [&]() noexcept { return state.device.StopAll(); });
+            }
+            {
+                std::scoped_lock lock(state.stateMutex);
+                if (SUCCEEDED(result)) state.safety.ConfirmAllStopped();
+                else {
+                    state.safety.MarkStopUnconfirmed(result);
+                    state.stopRecoveryRequested = true;
+                }
                 state.lastResult = result;
                 ++state.failSafeCount;
             }
@@ -577,25 +630,34 @@ HRESULT ProcessMessage(
         if (message.devicePath[dfgt::ipc::DevicePathCharacters - 1] != L'\0') {
             return E_INVALIDARG;
         }
-        std::scoped_lock lock(state.mutex);
         auto result = S_OK;
-        if (!state.device.IsOpen()) {
+        {
+            std::scoped_lock lock(state.stateMutex);
             state.safety.BeginInitialize();
-            result = state.device.Open(message.devicePath);
+        }
+        {
+            std::scoped_lock lock(state.deviceMutex);
+            if (!state.device.IsOpen()) {
+                result = state.device.Open(message.devicePath);
+            }
         }
         opened = SUCCEEDED(result);
-        state.ffbClientConnected = opened;
         sessionGeneration = state.safetyGeneration.load();
-        state.lastResult = result;
         forceActive = false;
-        if (opened &&
-            state.safety.Mode() ==
-                dfgt::broker::SafetyMode::Initializing) {
-            state.safety.ConfirmNeutralReady();
-            result = state.safety.Arm();
+        {
+            std::scoped_lock lock(state.stateMutex);
+            state.ffbClientConnected = opened;
             state.lastResult = result;
-        } else if (FAILED(result)) {
-            state.safety.MarkStopUnconfirmed(result);
+            if (opened &&
+                state.safety.Mode() ==
+                    dfgt::broker::SafetyMode::Initializing) {
+                state.safety.ConfirmNeutralReady();
+                result = state.safety.Arm();
+                state.lastResult = result;
+            } else if (FAILED(result)) {
+                state.safety.MarkStopUnconfirmed(result);
+                state.stopRecoveryRequested = true;
+            }
         }
         return result;
     }
@@ -608,33 +670,72 @@ HRESULT ProcessMessage(
             message.value != 0 || message.auxiliary != 0;
         if (suppressForceWrites) return S_OK;
         {
-            std::scoped_lock lock(state.mutex);
-            dfgt::broker::EffectCoordinator effects(
-                state.device, state.safety);
-            const auto result =
-                effects.SetSoftware(message.value, message.auxiliary);
+            if (forceActive) {
+                std::scoped_lock lock(state.stateMutex);
+                const auto allowed = state.safety.CanAcceptForce();
+                if (FAILED(allowed)) return allowed;
+            }
+            HRESULT result = S_OK;
+            {
+                std::scoped_lock lock(state.deviceMutex);
+                if (sessionGeneration !=
+                    state.safetyGeneration.load()) {
+                    return dfgt::broker::DFGT_E_EMERGENCY_LATCHED;
+                }
+                result = forceActive
+                    ? state.device.Constant(
+                        message.value, message.auxiliary)
+                    : state.device.StopSoftwareSlot();
+            }
+            std::scoped_lock lock(state.stateMutex);
+            if (SUCCEEDED(result)) {
+                if (forceActive) {
+                    state.safety.Activate(
+                        dfgt::broker::PhysicalSlot::Software);
+                } else {
+                    state.safety.ConfirmSlotStopped(
+                        dfgt::broker::PhysicalSlot::Software);
+                }
+            } else {
+                state.safety.MarkStopUnconfirmed(result);
+                state.stopRecoveryRequested = true;
+            }
             state.lastResult = result;
             return result;
         }
     case Command::StopSoftwareSlot:
         forceActive = false;
         {
-            std::scoped_lock lock(state.mutex);
-            dfgt::broker::EffectCoordinator effects(
-                state.device, state.safety);
-            const auto result = effects.StopSoftware();
+            HRESULT result = S_OK;
+            {
+                std::scoped_lock lock(state.deviceMutex);
+                result = state.device.StopSoftwareSlot();
+            }
+            std::scoped_lock lock(state.stateMutex);
+            if (SUCCEEDED(result)) {
+                state.safety.ConfirmSlotStopped(
+                    dfgt::broker::PhysicalSlot::Software);
+            } else {
+                state.safety.MarkStopUnconfirmed(result);
+                state.stopRecoveryRequested = true;
+            }
             state.lastResult = result;
             return result;
         }
     case Command::StopAll:
         forceActive = false;
         {
-            std::scoped_lock lock(state.mutex);
-            const auto result = state.device.StopAll();
+            HRESULT result = S_OK;
+            {
+                std::scoped_lock lock(state.deviceMutex);
+                result = state.device.StopAll();
+            }
+            std::scoped_lock lock(state.stateMutex);
             if (SUCCEEDED(result)) {
                 state.safety.ConfirmAllStopped();
             } else {
                 state.safety.MarkStopUnconfirmed(result);
+                state.stopRecoveryRequested = true;
             }
             state.lastResult = result;
             return result;
@@ -645,8 +746,16 @@ HRESULT ProcessMessage(
             return dfgt::broker::DFGT_E_EMERGENCY_LATCHED;
         }
         {
-            std::scoped_lock lock(state.mutex);
-            const auto result = state.device.SetRange(message.value);
+            HRESULT result = S_OK;
+            {
+                std::scoped_lock lock(state.deviceMutex);
+                if (sessionGeneration !=
+                    state.safetyGeneration.load()) {
+                    return dfgt::broker::DFGT_E_EMERGENCY_LATCHED;
+                }
+                result = state.device.SetRange(message.value);
+            }
+            std::scoped_lock lock(state.stateMutex);
             state.lastResult = result;
             return result;
         }
@@ -658,13 +767,31 @@ HRESULT ProcessMessage(
         forceActive = true;
         if (suppressForceWrites) return S_OK;
         {
-            std::scoped_lock lock(state.mutex);
-            dfgt::broker::EffectCoordinator effects(
-                state.device, state.safety);
-            const auto result = effects.SetSpring(
-                message.value, message.auxiliary,
-                message.value3, message.value4,
-                message.value5, message.value6);
+            {
+                std::scoped_lock lock(state.stateMutex);
+                const auto allowed = state.safety.CanAcceptForce();
+                if (FAILED(allowed)) return allowed;
+            }
+            HRESULT result = S_OK;
+            {
+                std::scoped_lock lock(state.deviceMutex);
+                if (sessionGeneration !=
+                    state.safetyGeneration.load()) {
+                    return dfgt::broker::DFGT_E_EMERGENCY_LATCHED;
+                }
+                result = state.device.Spring(
+                    message.value, message.auxiliary,
+                    message.value3, message.value4,
+                    message.value5, message.value6);
+            }
+            std::scoped_lock lock(state.stateMutex);
+            if (SUCCEEDED(result)) {
+                state.safety.Activate(
+                    dfgt::broker::PhysicalSlot::Spring);
+            } else {
+                state.safety.MarkStopUnconfirmed(result);
+                state.stopRecoveryRequested = true;
+            }
             state.lastResult = result;
             return result;
         }
@@ -676,12 +803,30 @@ HRESULT ProcessMessage(
         forceActive = true;
         if (suppressForceWrites) return S_OK;
         {
-            std::scoped_lock lock(state.mutex);
-            dfgt::broker::EffectCoordinator effects(
-                state.device, state.safety);
-            const auto result = effects.SetDamper(
-                message.value, message.auxiliary,
-                message.value5, message.value6);
+            {
+                std::scoped_lock lock(state.stateMutex);
+                const auto allowed = state.safety.CanAcceptForce();
+                if (FAILED(allowed)) return allowed;
+            }
+            HRESULT result = S_OK;
+            {
+                std::scoped_lock lock(state.deviceMutex);
+                if (sessionGeneration !=
+                    state.safetyGeneration.load()) {
+                    return dfgt::broker::DFGT_E_EMERGENCY_LATCHED;
+                }
+                result = state.device.Damper(
+                    message.value, message.auxiliary,
+                    message.value5, message.value6);
+            }
+            std::scoped_lock lock(state.stateMutex);
+            if (SUCCEEDED(result)) {
+                state.safety.Activate(
+                    dfgt::broker::PhysicalSlot::DamperOrInertia);
+            } else {
+                state.safety.MarkStopUnconfirmed(result);
+                state.stopRecoveryRequested = true;
+            }
             state.lastResult = result;
             return result;
         }
@@ -693,12 +838,30 @@ HRESULT ProcessMessage(
         forceActive = true;
         if (suppressForceWrites) return S_OK;
         {
-            std::scoped_lock lock(state.mutex);
-            dfgt::broker::EffectCoordinator effects(
-                state.device, state.safety);
-            const auto result = effects.SetFriction(
-                message.value, message.auxiliary,
-                message.value5, message.value6);
+            {
+                std::scoped_lock lock(state.stateMutex);
+                const auto allowed = state.safety.CanAcceptForce();
+                if (FAILED(allowed)) return allowed;
+            }
+            HRESULT result = S_OK;
+            {
+                std::scoped_lock lock(state.deviceMutex);
+                if (sessionGeneration !=
+                    state.safetyGeneration.load()) {
+                    return dfgt::broker::DFGT_E_EMERGENCY_LATCHED;
+                }
+                result = state.device.Friction(
+                    message.value, message.auxiliary,
+                    message.value5, message.value6);
+            }
+            std::scoped_lock lock(state.stateMutex);
+            if (SUCCEEDED(result)) {
+                state.safety.Activate(
+                    dfgt::broker::PhysicalSlot::Friction);
+            } else {
+                state.safety.MarkStopUnconfirmed(result);
+                state.stopRecoveryRequested = true;
+            }
             state.lastResult = result;
             return result;
         }
@@ -711,18 +874,26 @@ HRESULT ProcessMessage(
         forceActive = false;
         opened = false;
         {
-            std::scoped_lock lock(state.mutex);
-            state.ffbClientConnected = false;
-            const auto result = state.device.StopAll();
+            bool resetRange = false;
+            {
+                std::scoped_lock lock(state.stateMutex);
+                state.ffbClientConnected = false;
+                resetRange = !state.controlClientConnected;
+            }
+            HRESULT result = S_OK;
+            {
+                std::scoped_lock lock(state.deviceMutex);
+                result = state.device.StopAll();
+                if (resetRange) state.device.SetRange(900);
+            }
+            std::scoped_lock lock(state.stateMutex);
             if (SUCCEEDED(result)) {
                 state.safety.ConfirmAllStopped();
             } else {
                 state.safety.MarkStopUnconfirmed(result);
+                state.stopRecoveryRequested = true;
             }
             state.lastResult = result;
-            if (!state.controlClientConnected) {
-                state.device.SetRange(900);
-            }
         }
         return S_OK;
     default:
@@ -813,7 +984,7 @@ int RunClient(
     if (nonceResult < 0) sessionNonce = 0;
     if (clientPid == 0 || !clientProcess.Valid() ||
         sessionNonce == 0) {
-        std::scoped_lock lock(state.mutex);
+        std::scoped_lock lock(state.stateMutex);
         state.lastResult = HRESULT_FROM_WIN32(ERROR_ACCESS_DENIED);
         ++state.failSafeCount;
         return 1;
@@ -852,14 +1023,25 @@ int RunClient(
                 continue;
             }
             HRESULT result = S_OK;
+            bool resetRange = false;
             {
-                std::scoped_lock lock(state.mutex);
+                std::scoped_lock lock(state.stateMutex);
+                resetRange = !state.controlClientConnected;
+            }
+            {
+                std::scoped_lock lock(state.deviceMutex);
                 result = state.device.StopAll();
+                if (resetRange) state.device.SetRange(900);
+            }
+            {
+                std::scoped_lock lock(state.stateMutex);
                 state.ffbClientConnected = false;
                 state.lastResult = result;
                 ++state.failSafeCount;
-                if (!state.controlClientConnected) {
-                    state.device.SetRange(900);
+                if (SUCCEEDED(result)) state.safety.ConfirmAllStopped();
+                else {
+                    state.safety.MarkStopUnconfirmed(result);
+                    state.stopRecoveryRequested = true;
                 }
             }
             std::wcout
@@ -877,7 +1059,7 @@ int RunClient(
             sessionGeneration,
             suppressForceWrites);
         {
-            std::scoped_lock lock(state.mutex);
+            std::scoped_lock lock(state.stateMutex);
             forceActive =
                 state.safety.ActiveSlots() !=
                 dfgt::broker::PhysicalSlot::None;
@@ -928,10 +1110,22 @@ int RunClient(
             leaseDeadline = GetTickCount64() + kReadTimeoutMs;
         }
         if (!WriteResponse(pipe, message.sequence, result)) {
-            std::scoped_lock lock(state.mutex);
-            state.device.StopAll();
-            state.ffbClientConnected = false;
-            ++state.failSafeCount;
+            HRESULT stopResult = S_OK;
+            {
+                std::scoped_lock lock(state.deviceMutex);
+                stopResult = state.device.StopAll();
+            }
+            {
+                std::scoped_lock lock(state.stateMutex);
+                state.ffbClientConnected = false;
+                ++state.failSafeCount;
+                state.lastResult = stopResult;
+                if (SUCCEEDED(stopResult)) state.safety.ConfirmAllStopped();
+                else {
+                    state.safety.MarkStopUnconfirmed(stopResult);
+                    state.stopRecoveryRequested = true;
+                }
+            }
             return 0;
         }
         if (message.command == dfgt::ipc::Command::Close) {
@@ -954,8 +1148,12 @@ int RunClient(
 }
 
 dfgt::ipc::control::Status SnapshotStatus(BrokerState& state) {
-    std::scoped_lock lock(state.mutex);
-    auto status = state.device.Status();
+    dfgt::ipc::control::Status status{};
+    {
+        std::scoped_lock lock(state.deviceMutex);
+        status = state.device.Status();
+    }
+    std::scoped_lock lock(state.stateMutex);
     status.ffbClientConnected =
         state.ffbClientConnected ? 1u : 0u;
     status.controlClientConnected =
@@ -993,7 +1191,6 @@ HRESULT ProcessControlRequest(
         return E_INVALIDARG;
     }
 
-    std::scoped_lock lock(state.mutex);
     HRESULT result = S_OK;
     switch (request.command) {
     case Command::Ping:
@@ -1003,58 +1200,116 @@ HRESULT ProcessControlRequest(
         if (request.devicePath[
                 dfgt::ipc::DevicePathCharacters - 1] != L'\0') {
             result = E_INVALIDARG;
-        } else if (!state.device.IsOpen()) {
-            state.safety.BeginInitialize();
-            result = state.device.Open(request.devicePath);
-            if (SUCCEEDED(result) &&
-                state.safety.Mode() ==
-                    dfgt::broker::SafetyMode::Initializing) {
-                state.safety.ConfirmNeutralReady();
-                result = state.safety.Arm();
-            } else if (FAILED(result)) {
-                state.safety.MarkStopUnconfirmed(result);
+        } else {
+            {
+                std::scoped_lock lock(state.stateMutex);
+                state.safety.BeginInitialize();
+            }
+            {
+                std::scoped_lock lock(state.deviceMutex);
+                if (!state.device.IsOpen()) {
+                    result = state.device.Open(request.devicePath);
+                }
+            }
+            {
+                std::scoped_lock lock(state.stateMutex);
+                if (SUCCEEDED(result) &&
+                    state.safety.Mode() ==
+                        dfgt::broker::SafetyMode::Initializing) {
+                    state.safety.ConfirmNeutralReady();
+                    result = state.safety.Arm();
+                } else if (FAILED(result)) {
+                    state.safety.MarkStopUnconfirmed(result);
+                    state.stopRecoveryRequested = true;
+                }
             }
         }
         break;
-    case Command::ApplyProfile:
+    case Command::ApplyProfile: {
+        {
+            std::scoped_lock lock(state.stateMutex);
+            const auto allowed = state.safety.CanAcceptForce();
+            if (FAILED(allowed)) {
+                result = allowed;
+                break;
+            }
+        }
+        std::scoped_lock lock(state.deviceMutex);
         result = state.device.ApplyProfile(request.profile);
         break;
+    }
     case Command::EmergencyStop:
         // Latch and invalidate the current FFB session before touching HID.
         {
-            const auto latchResult = state.safety.LatchEmergency();
-            ++state.safetyGeneration;
-            result = state.device.StopAll();
-            if (SUCCEEDED(result)) {
-                state.safety.ConfirmAllStopped();
-                result = latchResult;
-            } else {
-                state.safety.MarkStopUnconfirmed(result);
+            HRESULT latchResult = S_OK;
+            {
+                std::scoped_lock lock(state.stateMutex);
+                latchResult = state.safety.LatchEmergency();
+                ++state.safetyGeneration;
+            }
+            {
+                result = dfgt::broker::TryEmergencyIo(
+                    state.deviceMutex,
+                    std::chrono::milliseconds(5),
+                    [&]() noexcept { return state.device.StopAll(); });
+            }
+            {
+                std::scoped_lock lock(state.stateMutex);
+                if (SUCCEEDED(result)) {
+                    state.safety.ConfirmAllStopped();
+                    result = latchResult;
+                } else {
+                    state.safety.MarkStopUnconfirmed(result);
+                    state.stopRecoveryRequested = true;
+                }
+                ++state.failSafeCount;
             }
         }
-        ++state.failSafeCount;
         break;
-    case Command::AcknowledgeAndRearm:
+    case Command::AcknowledgeAndRearm: {
+        bool deviceOpen = false;
+        {
+            std::scoped_lock lock(state.deviceMutex);
+            deviceOpen = state.device.IsOpen();
+        }
+        std::scoped_lock lock(state.stateMutex);
         result = state.safety.AcknowledgeAndRearm(
-            state.device.IsOpen(),
+            deviceOpen,
             state.safety.StopConfirmed());
         break;
-    case Command::DetachDevice:
-        result = state.device.StopAll();
-        if (SUCCEEDED(result)) {
-            state.safety.ConfirmAllStopped();
-        } else {
-            state.safety.MarkStopUnconfirmed(result);
+    }
+    case Command::DetachDevice: {
+        bool closeDevice = false;
+        {
+            std::scoped_lock lock(state.stateMutex);
+            closeDevice = !state.ffbClientConnected;
         }
-        state.device.SetRange(900);
-        if (!state.ffbClientConnected) state.device.Close();
-        if (SUCCEEDED(result)) state.safety.Disconnect();
+        {
+            std::scoped_lock lock(state.deviceMutex);
+            result = state.device.StopAll();
+            state.device.SetRange(900);
+            if (closeDevice) state.device.Close();
+        }
+        {
+            std::scoped_lock lock(state.stateMutex);
+            if (SUCCEEDED(result)) {
+                state.safety.ConfirmAllStopped();
+                state.safety.Disconnect();
+            } else {
+                state.safety.MarkStopUnconfirmed(result);
+                state.stopRecoveryRequested = true;
+            }
+        }
         break;
+    }
     default:
         result = E_INVALIDARG;
         break;
     }
-    state.lastResult = result;
+    {
+        std::scoped_lock lock(state.stateMutex);
+        state.lastResult = result;
+    }
     return result;
 }
 
@@ -1090,7 +1345,7 @@ void RunControlServer(
             continue;
         }
         {
-            std::scoped_lock lock(state.mutex);
+            std::scoped_lock lock(state.stateMutex);
             state.controlClientConnected = true;
         }
 
@@ -1128,7 +1383,7 @@ void RunControlServer(
         }
 
         {
-            std::scoped_lock lock(state.mutex);
+            std::scoped_lock lock(state.stateMutex);
             state.controlClientConnected = false;
         }
         DisconnectNamedPipe(pipe);
@@ -1160,6 +1415,10 @@ int wmain(int argc, wchar_t** argv) {
     }
 
     BrokerState state;
+    std::jthread recoveryThread(
+        [&state](std::stop_token stop) {
+            RunStopRecovery(state, stop);
+        });
     std::jthread controlThread(
         [&state, security, diagnostics](std::stop_token stop) {
             RunControlServer(
