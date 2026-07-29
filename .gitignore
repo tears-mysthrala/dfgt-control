@@ -1,0 +1,55 @@
+# Build output
+**/build-*/
+**/bin/
+**/obj/
+**/obj-*/
+**/publish/
+artifacts/
+dist/
+
+# Local dependencies and editor state
+node_modules/
+public/
+server.js
+package.json
+package-lock.json
+test/
+sdk-helper/
+LEGACY-DRIVER-AUDIT.md
+ffb-driver/VALIDATION.md
+ffb-driver/scripts/Enable-Hvci.ps1
+ffb-driver/scripts/Invoke-*.ps1
+ffb-driver/scripts/Invoke-Physical*.ps1
+ffb-driver/scripts/Test-DirectInputIntegration.ps1
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.VC.db
+
+# Local diagnostics and hardware captures
+**/test-results/
+*.launcher.json
+hid-*.json
+post-migration-*.json
+dfgt-control-screenshot.png
+*.etl
+*.evtx
+*.dmp
+*.pdb
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.pfx
+*.p12
+*.key
+*.cer
+*.snk
+
+# OS noise
+Thumbs.db
+Desktop.ini
+.DS_Store

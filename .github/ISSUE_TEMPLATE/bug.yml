@@ -1,0 +1,52 @@
+name: Bug report
+description: Report a reproducible DFGT Control problem
+title: "[Bug] "
+labels: ["bug", "needs-triage"]
+body:
+  - type: checkboxes
+    attributes:
+      label: Safety
+      options:
+        - label: I stopped using force feedback if force remained active unexpectedly.
+          required: true
+        - label: I removed usernames, personal paths and device instance IDs from logs.
+          required: true
+  - type: input
+    attributes:
+      label: DFGT Control version
+      placeholder: v0.1.0
+    validations:
+      required: true
+  - type: input
+    attributes:
+      label: Windows version
+      placeholder: Windows 11 24H2, build 26100
+    validations:
+      required: true
+  - type: dropdown
+    attributes:
+      label: Memory Integrity/HVCI
+      options: ["Running", "Not running", "Unknown"]
+    validations:
+      required: true
+  - type: dropdown
+    attributes:
+      label: Game architecture
+      options: ["x64", "x86", "Both/unknown", "Not game-specific"]
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: What happened?
+      description: Include the effect type, profile and exact safe reproduction.
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Expected behaviour
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Sanitized diagnostics
+      render: text

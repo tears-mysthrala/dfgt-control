@@ -1,0 +1,36 @@
+name: Game compatibility report
+description: Share a tested game and force-feedback result
+title: "[Compatibility] "
+labels: ["compatibility"]
+body:
+  - type: input
+    attributes:
+      label: Game and version
+    validations:
+      required: true
+  - type: dropdown
+    attributes:
+      label: Architecture
+      options: ["x64", "x86", "Unknown"]
+    validations:
+      required: true
+  - type: input
+    attributes:
+      label: Windows build
+    validations:
+      required: true
+  - type: checkboxes
+    attributes:
+      label: Results
+      options:
+        - label: Steering, pedals and buttons work
+        - label: Constant/ramp force works
+        - label: Periodic effects work
+        - label: Spring/damper/friction work
+        - label: Per-game profile activates
+  - type: textarea
+    attributes:
+      label: Notes and profile
+      description: Do not attach copyrighted game files or personal logs.
+    validations:
+      required: true

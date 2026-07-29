@@ -1,0 +1,4 @@
+LIBRARY DfgtDirectInputFfb
+EXPORTS
+    DllCanUnloadNow PRIVATE
+    DllGetClassObject PRIVATE

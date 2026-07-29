@@ -1,0 +1,156 @@
+<Window x:Class="DfgtControl.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="DFGT Control" Width="980" Height="690"
+        MinWidth="820" MinHeight="600"
+        WindowStartupLocation="CenterScreen"
+        Background="#0D1014" Foreground="{StaticResource InkBrush}">
+  <Grid Margin="28">
+    <Grid.RowDefinitions>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="22"/>
+      <RowDefinition Height="*"/>
+      <RowDefinition Height="22"/>
+      <RowDefinition Height="Auto"/>
+    </Grid.RowDefinitions>
+
+    <Grid>
+      <Grid.ColumnDefinitions>
+        <ColumnDefinition Width="*"/>
+        <ColumnDefinition Width="Auto"/>
+      </Grid.ColumnDefinitions>
+      <StackPanel>
+        <TextBlock Text="D F G T   C O N T R O L" FontSize="12" FontWeight="Bold"
+                   Foreground="{StaticResource AccentBrush}"/>
+        <TextBlock Text="Driving Force GT" FontSize="30" FontWeight="SemiBold"/>
+        <TextBlock Text="Control nativo · sin Logitech Gaming Software"
+                   Foreground="{StaticResource MutedBrush}" Margin="0,4,0,0"/>
+      </StackPanel>
+      <Border Grid.Column="1" Background="{StaticResource PanelBrush}"
+              CornerRadius="8" Padding="14,10" VerticalAlignment="Center">
+        <StackPanel Orientation="Horizontal">
+          <Ellipse x:Name="AgentDot" Width="9" Height="9" Fill="#66717E"
+                   Margin="0,0,9,0" VerticalAlignment="Center"/>
+          <TextBlock x:Name="AgentStatus" Text="Comprobando agente…"
+                     FontWeight="SemiBold"/>
+        </StackPanel>
+      </Border>
+    </Grid>
+
+    <Grid Grid.Row="2">
+      <Grid.ColumnDefinitions>
+        <ColumnDefinition Width="260"/>
+        <ColumnDefinition Width="18"/>
+        <ColumnDefinition Width="*"/>
+      </Grid.ColumnDefinitions>
+
+      <Border Background="{StaticResource PanelBrush}" CornerRadius="10" Padding="16">
+        <Grid>
+          <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="12"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="12"/>
+            <RowDefinition Height="Auto"/>
+          </Grid.RowDefinitions>
+          <TextBlock Text="PERFILES" FontSize="12" FontWeight="Bold"
+                     Foreground="{StaticResource MutedBrush}"/>
+          <ListBox x:Name="ProfilesList" Grid.Row="2"
+                   Background="Transparent" BorderThickness="0"
+                   Foreground="{StaticResource InkBrush}"
+                   DisplayMemberPath="Name"
+                   SelectionChanged="ProfilesList_OnSelectionChanged"/>
+          <Button Grid.Row="4" Content="+ Nuevo perfil"
+                  Click="AddProfile_OnClick"/>
+        </Grid>
+      </Border>
+
+      <Border Grid.Column="2" Background="{StaticResource PanelBrush}"
+              CornerRadius="10" Padding="24">
+        <ScrollViewer VerticalScrollBarVisibility="Auto">
+          <StackPanel x:Name="Editor">
+            <TextBlock Text="AJUSTES DEL PERFIL" FontSize="12" FontWeight="Bold"
+                       Foreground="{StaticResource MutedBrush}"/>
+            <TextBlock Text="Nombre" Margin="0,18,0,6"/>
+            <TextBox x:Name="ProfileName"/>
+            <TextBlock Text="Ejecutable del juego (vacío = escritorio)"
+                       Margin="0,15,0,6"/>
+            <DockPanel>
+              <Button DockPanel.Dock="Right" Content="Elegir…" Margin="10,0,0,0"
+                      Click="BrowseExecutable_OnClick"/>
+              <TextBox x:Name="ExecutablePath" IsReadOnly="True"/>
+            </DockPanel>
+
+            <Grid Margin="0,22,0,0">
+              <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="28"/>
+                <ColumnDefinition Width="*"/>
+              </Grid.ColumnDefinitions>
+              <StackPanel>
+                <DockPanel LastChildFill="False">
+                  <TextBlock Text="Rango"/>
+                  <TextBlock x:Name="RangeValue" DockPanel.Dock="Right"
+                             Foreground="{StaticResource AccentBrush}" Margin="8,0,0,0"/>
+                </DockPanel>
+                <Slider x:Name="Range" Minimum="40" Maximum="900"
+                        TickFrequency="10" IsSnapToTickEnabled="True"
+                        ValueChanged="Range_OnValueChanged"/>
+              </StackPanel>
+              <StackPanel Grid.Column="2">
+                <DockPanel LastChildFill="False">
+                  <TextBlock Text="Fuerza global"/>
+                  <TextBlock x:Name="OverallValue" DockPanel.Dock="Right"
+                             Foreground="{StaticResource AccentBrush}" Margin="8,0,0,0"/>
+                </DockPanel>
+                <Slider x:Name="Overall" Minimum="0" Maximum="100"
+                        TickFrequency="1" IsSnapToTickEnabled="True"
+                        ValueChanged="Percent_OnValueChanged"/>
+              </StackPanel>
+            </Grid>
+
+            <TextBlock Text="Tope dinámico" Margin="0,20,0,0"/>
+            <DockPanel LastChildFill="False">
+              <TextBlock Text="Resistencia al alcanzar el rango configurado"
+                         Foreground="{StaticResource MutedBrush}"/>
+              <TextBlock x:Name="BoundaryValue" DockPanel.Dock="Right"
+                         Foreground="{StaticResource AccentBrush}" Margin="8,0,0,0"/>
+            </DockPanel>
+            <Slider x:Name="Boundary" Minimum="0" Maximum="100"
+                    TickFrequency="1" IsSnapToTickEnabled="True"
+                    ValueChanged="Percent_OnValueChanged"/>
+
+            <UniformGrid Columns="2" Margin="0,20,0,0">
+              <StackPanel Margin="0,0,14,14">
+                <DockPanel LastChildFill="False"><TextBlock Text="Muelle"/><TextBlock x:Name="SpringValue" DockPanel.Dock="Right" Margin="8,0,0,0" Foreground="{StaticResource AccentBrush}"/></DockPanel>
+                <Slider x:Name="Spring" Minimum="0" Maximum="100" ValueChanged="Percent_OnValueChanged"/>
+              </StackPanel>
+              <StackPanel Margin="14,0,0,14">
+                <DockPanel LastChildFill="False"><TextBlock Text="Amortiguación"/><TextBlock x:Name="DamperValue" DockPanel.Dock="Right" Margin="8,0,0,0" Foreground="{StaticResource AccentBrush}"/></DockPanel>
+                <Slider x:Name="Damper" Minimum="0" Maximum="100" ValueChanged="Percent_OnValueChanged"/>
+              </StackPanel>
+              <StackPanel Margin="0,0,14,0">
+                <DockPanel LastChildFill="False"><TextBlock Text="Fricción"/><TextBlock x:Name="FrictionValue" DockPanel.Dock="Right" Margin="8,0,0,0" Foreground="{StaticResource AccentBrush}"/></DockPanel>
+                <Slider x:Name="Friction" Minimum="0" Maximum="100" ValueChanged="Percent_OnValueChanged"/>
+              </StackPanel>
+              <StackPanel Margin="14,0,0,0">
+                <DockPanel LastChildFill="False"><TextBlock Text="Efectos periódicos"/><TextBlock x:Name="PeriodicValue" DockPanel.Dock="Right" Margin="8,0,0,0" Foreground="{StaticResource AccentBrush}"/></DockPanel>
+                <Slider x:Name="Periodic" Minimum="0" Maximum="100" ValueChanged="Percent_OnValueChanged"/>
+              </StackPanel>
+            </UniformGrid>
+          </StackPanel>
+        </ScrollViewer>
+      </Border>
+    </Grid>
+
+    <Grid Grid.Row="4">
+      <TextBlock x:Name="SaveStatus" Foreground="{StaticResource MutedBrush}"
+                 VerticalAlignment="Center"/>
+      <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+        <Button Content="Eliminar" Background="#343D47" Foreground="{StaticResource InkBrush}"
+                Margin="0,0,10,0" Click="DeleteProfile_OnClick"/>
+        <Button Content="Guardar y aplicar" Click="Save_OnClick"/>
+      </StackPanel>
+    </Grid>
+  </Grid>
+</Window>

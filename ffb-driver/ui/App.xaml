@@ -1,0 +1,38 @@
+<Application x:Class="DfgtControl.App"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             StartupUri="MainWindow.xaml">
+  <Application.Resources>
+    <Color x:Key="Ink">#EEF3F8</Color>
+    <Color x:Key="Muted">#8D9AAA</Color>
+    <Color x:Key="Panel">#171C22</Color>
+    <Color x:Key="PanelRaised">#20262E</Color>
+    <Color x:Key="Accent">#35D6A0</Color>
+    <SolidColorBrush x:Key="InkBrush" Color="{StaticResource Ink}"/>
+    <SolidColorBrush x:Key="MutedBrush" Color="{StaticResource Muted}"/>
+    <SolidColorBrush x:Key="PanelBrush" Color="{StaticResource Panel}"/>
+    <SolidColorBrush x:Key="RaisedBrush" Color="{StaticResource PanelRaised}"/>
+    <SolidColorBrush x:Key="AccentBrush" Color="{StaticResource Accent}"/>
+    <Style TargetType="TextBlock">
+      <Setter Property="Foreground" Value="{StaticResource InkBrush}"/>
+      <Setter Property="FontFamily" Value="Segoe UI Variable Text"/>
+    </Style>
+    <Style TargetType="Button">
+      <Setter Property="Foreground" Value="#09130F"/>
+      <Setter Property="Background" Value="{StaticResource AccentBrush}"/>
+      <Setter Property="BorderThickness" Value="0"/>
+      <Setter Property="Padding" Value="16,9"/>
+      <Setter Property="FontWeight" Value="SemiBold"/>
+      <Setter Property="Cursor" Value="Hand"/>
+    </Style>
+    <Style TargetType="TextBox">
+      <Setter Property="Foreground" Value="{StaticResource InkBrush}"/>
+      <Setter Property="Background" Value="#11151A"/>
+      <Setter Property="BorderBrush" Value="#343D47"/>
+      <Setter Property="Padding" Value="10,7"/>
+    </Style>
+    <Style TargetType="Slider">
+      <Setter Property="Foreground" Value="{StaticResource AccentBrush}"/>
+    </Style>
+  </Application.Resources>
+</Application>
