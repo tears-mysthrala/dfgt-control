@@ -290,3 +290,18 @@ target_link_options(DfgtTimingJitterTests PRIVATE
 set_target_properties(DfgtTimingJitterTests PROPERTIES
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 add_test(NAME timing-jitter COMMAND DfgtTimingJitterTests)
+
+add_executable(DfgtAgentRecoveryPolicyTests
+    tests/AgentRecoveryPolicyTests.cpp)
+target_compile_features(DfgtAgentRecoveryPolicyTests PRIVATE cxx_std_20)
+target_compile_definitions(DfgtAgentRecoveryPolicyTests PRIVATE
+    UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_compile_options(DfgtAgentRecoveryPolicyTests PRIVATE
+    /W4 /WX /permissive- /guard:cf)
+target_link_options(DfgtAgentRecoveryPolicyTests PRIVATE
+    /guard:cf /DYNAMICBASE /NXCOMPAT)
+set_target_properties(DfgtAgentRecoveryPolicyTests PROPERTIES
+    MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+add_test(
+    NAME agent-recovery-policy
+    COMMAND DfgtAgentRecoveryPolicyTests)

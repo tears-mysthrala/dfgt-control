@@ -22,9 +22,10 @@ Physical tests are excluded from CTest and GitHub Actions.
 | `broker-framing-integration` | Pass | Pass | Partial client cannot retain the pipe |
 | `profile-document-validation` | Pass | Pass | Unique IDs/paths/desktop and bounds |
 | `timing-jitter` | Pass | Pass | High-resolution 2 ms timer remains bounded |
+| `agent-recovery-policy` | Pass | Pass | Reconnect/backoff and no automatic rearm |
 
 Last local run: Windows 11 build 26100, MSVC 19.44, SDK 10.0.26100.0,
-CMake 3.29.2 and .NET SDK 9.0.316. Result: 14/14 x64 and 14/14 x86.
+CMake 3.29.2 and .NET SDK 9.0.316. Result: 15/15 x64 and 15/15 x86.
 
 The local 1,000-sample timing run produced:
 

@@ -15,6 +15,7 @@
 #include "ControlClient.h"
 #include "DeviceDiscovery.h"
 #include "ProfileStore.h"
+#include "AgentRecoveryPolicy.h"
 #include "../shared/AgentUiProtocol.h"
 #include "../shared/BoundedIo.h"
 #include "../shared/PipePeerValidation.h"
@@ -223,11 +224,7 @@ private:
             control_.Close();
             activeProfile_.clear();
             ConnectDevice();
-        } else if (
-            status.state ==
-                dfgt::ipc::control::DeviceState::Disconnected ||
-            status.state ==
-                dfgt::ipc::control::DeviceState::Faulted) {
+        } else if (dfgt::agent::RequiresReconnect(status.state)) {
             activeProfile_.clear();
             ConnectDevice();
         } else if (
@@ -258,8 +255,8 @@ private:
         const auto now = GetTickCount64();
         if (now < nextBrokerAttempt_) return result;
         nextBrokerAttempt_ = now + brokerBackoffMs_;
-        brokerBackoffMs_ = std::min<DWORD>(
-            brokerBackoffMs_ * 2, 30000);
+        brokerBackoffMs_ =
+            dfgt::agent::NextBrokerBackoff(brokerBackoffMs_);
         const auto broker =
             ModuleDirectory() + L"\\DfgtFfbBroker.exe";
         STARTUPINFOW startup{};
