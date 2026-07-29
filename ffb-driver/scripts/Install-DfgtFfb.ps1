@@ -455,13 +455,11 @@ if ($PSCmdlet.ShouldProcess($InstallRoot, 'Install DFGT user-mode FFB stack and 
                         & $installedStatusTool 2>$null | Out-String
                     }
                     else { $null }
-                    $statusExit = $LASTEXITCODE
                     $status = try {
                         $statusOutput | ConvertFrom-Json
                     }
                     catch { $null }
-                    if ($statusExit -ne 0 -or
-                        $null -eq $status -or
+                    if ($null -eq $status -or
                         $status.connected -ne 0 -or
                         $status.ffbClientConnected -ne 0) {
                         throw 'PrepareForMaintenance was not confirmed. Close games and retry with the wheel disconnected.'
