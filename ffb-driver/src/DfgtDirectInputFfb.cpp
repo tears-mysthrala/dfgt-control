@@ -1243,10 +1243,24 @@ private:
     }
 
     void TimerLoop(std::stop_token stop) noexcept {
-        std::mutex waitMutex;
-        std::unique_lock waitLock(waitMutex);
+        auto timer = CreateWaitableTimerExW(
+            nullptr,
+            nullptr,
+            CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+            TIMER_ALL_ACCESS);
+        if (timer == nullptr) {
+            timer = CreateWaitableTimerW(nullptr, FALSE, nullptr);
+        }
+        LARGE_INTEGER due{};
+        due.QuadPart = -20000; // Relative 2 ms in 100 ns units.
+        const auto timerReady = timer != nullptr &&
+            SetWaitableTimer(timer, &due, 2, nullptr, nullptr, FALSE);
         while (!stop.stop_requested()) {
-            timerWake_.wait_for(waitLock, std::chrono::milliseconds(2));
+            if (timerReady) {
+                WaitForSingleObject(timer, 10);
+            } else {
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
             if (stop.stop_requested()) break;
 
             bool rerenderConditions = false;
@@ -1279,6 +1293,10 @@ private:
             else RenderCurrent(now);
             const auto epoch = ++renderEpoch_;
             transport_.UpdateRenderEpoch(epoch);
+        }
+        if (timer != nullptr) {
+            CancelWaitableTimer(timer);
+            CloseHandle(timer);
         }
     }
 

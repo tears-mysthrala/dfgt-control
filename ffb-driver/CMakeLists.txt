@@ -2,6 +2,14 @@ cmake_minimum_required(VERSION 3.24)
 project(DfgtDirectInputFfb LANGUAGES CXX)
 enable_testing()
 
+option(DFGT_STATIC_ANALYSIS "Enable MSVC static analysis" OFF)
+if(MSVC)
+    add_compile_options(/sdl)
+    if(DFGT_STATIC_ANALYSIS)
+        add_compile_options(/analyze)
+    endif()
+endif()
+
 add_library(DfgtDirectInputFfb SHARED
     src/DfgtDirectInputFfb.cpp
     src/DfgtDirectInputFfb.def)

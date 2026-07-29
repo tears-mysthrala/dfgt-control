@@ -55,7 +55,7 @@ Invoke-Checked dotnet @(
     'publish', (Join-Path $driver 'ui\DfgtControl.csproj'),
     '-c', 'Release',
     '-r', 'win-x64',
-    '--self-contained', 'false',
+    '--self-contained', 'true',
     '-o', (Join-Path $driver 'ui\publish'))
 
 if (-not $SkipTests) {
@@ -117,6 +117,58 @@ Copy-Item -LiteralPath @(
     (Join-Path $root 'docs\ARCHITECTURE.md')
 ) -Destination (Join-Path $stage 'docs')
 
+$commitSha = (& git -C $root rev-parse HEAD).Trim()
+if ($LASTEXITCODE -ne 0 -or
+    $commitSha -notmatch '^[0-9a-f]{40}$') {
+    throw 'Could not resolve the source commit SHA.'
+}
+$commitTimestampText = (& git -C $root show -s --format=%cI HEAD).Trim()
+if ($LASTEXITCODE -ne 0) {
+    throw 'Could not resolve the source commit timestamp.'
+}
+$commitTimestamp = [DateTimeOffset]::Parse($commitTimestampText).UtcDateTime
+$sbom = [ordered]@{
+    spdxVersion = 'SPDX-2.3'
+    dataLicense = 'CC0-1.0'
+    SPDXID = 'SPDXRef-DOCUMENT'
+    name = "DfgtControl-$Version"
+    documentNamespace = "https://github.com/tears-mysthrala/dfgt-control/sbom/$commitSha"
+    creationInfo = [ordered]@{
+        created = $commitTimestamp.ToString('yyyy-MM-ddTHH:mm:ssZ')
+        creators = @('Tool: DfgtControl-Build-Release')
+    }
+    packages = @(
+        [ordered]@{
+            name = 'DfgtControl'
+            SPDXID = 'SPDXRef-Package-DfgtControl'
+            versionInfo = $Version
+            downloadLocation = 'NOASSERTION'
+            filesAnalyzed = $false
+            licenseConcluded = 'NOASSERTION'
+            licenseDeclared = 'MIT'
+            copyrightText = 'NOASSERTION'
+            externalRefs = @(
+                [ordered]@{
+                    referenceCategory = 'OTHER'
+                    referenceType = 'vcs'
+                    referenceLocator = "git+https://github.com/tears-mysthrala/dfgt-control.git@$commitSha"
+                }
+            )
+        }
+    )
+    relationships = @(
+        [ordered]@{
+            spdxElementId = 'SPDXRef-DOCUMENT'
+            relationshipType = 'DESCRIBES'
+            relatedSpdxElement = 'SPDXRef-Package-DfgtControl'
+        }
+    )
+}
+[IO.File]::WriteAllText(
+    (Join-Path $stage 'SBOM.spdx.json'),
+    ($sbom | ConvertTo-Json -Depth 8),
+    [Text.UTF8Encoding]::new($false))
+
 $manifestFiles = Get-ChildItem -LiteralPath $stage -File -Recurse |
     Sort-Object FullName |
     ForEach-Object {
@@ -128,7 +180,8 @@ $manifestFiles = Get-ChildItem -LiteralPath $stage -File -Recurse |
 $manifest = [ordered]@{
     schemaVersion = 1
     version = $Version
-    createdAtUtc = [DateTime]::UtcNow.ToString('o')
+    commitSha = $commitSha
+    createdAtUtc = $commitTimestamp.ToString('o')
     files = @($manifestFiles)
 }
 [IO.File]::WriteAllText(
@@ -136,6 +189,8 @@ $manifest = [ordered]@{
     ($manifest | ConvertTo-Json -Depth 5),
     [Text.UTF8Encoding]::new($false))
 
+Get-ChildItem -LiteralPath $stage -File -Recurse |
+    ForEach-Object { $_.LastWriteTimeUtc = $commitTimestamp }
 Compress-Archive -LiteralPath $stage -DestinationPath $zip `
     -CompressionLevel Optimal
 $hash = Get-FileHash -LiteralPath $zip -Algorithm SHA256

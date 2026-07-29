@@ -13,6 +13,11 @@ jobs:
   windows:
     runs-on: windows-latest
     timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
 
     steps:
       - name: Check out source
@@ -28,6 +33,13 @@ jobs:
         shell: pwsh
         run: .\tools\Build-Release.ps1 -Version 0.1.0-ci
 
+      - name: Attest package provenance and SBOM
+        if: github.event_name != 'pull_request'
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4
+        with:
+          subject-path: artifacts/DfgtControl-v0.1.0-ci-win.zip
+          sbom-path: artifacts/DfgtControl-v0.1.0-ci-win/SBOM.spdx.json
+
       - name: Upload redistributable package
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
@@ -37,3 +49,29 @@ jobs:
             artifacts/*.sha256
           if-no-files-found: error
           retention-days: 14
+
+  codeql:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@e4fba868fa4b1b91e1fdab776edc8cfbe6e9fb81 # v4.37.3
+        with:
+          languages: c-cpp,csharp
+
+      - name: Build analyzed targets
+        shell: pwsh
+        run: |
+          cmake -S ffb-driver -B ffb-driver/build-codeql -A x64
+          cmake --build ffb-driver/build-codeql --config Release
+          dotnet build ffb-driver/ui/DfgtControl.csproj -c Release
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@e4fba868fa4b1b91e1fdab776edc8cfbe6e9fb81 # v4.37.3
