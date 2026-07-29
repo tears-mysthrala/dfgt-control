@@ -305,3 +305,9 @@ set_target_properties(DfgtAgentRecoveryPolicyTests PROPERTIES
 add_test(
     NAME agent-recovery-policy
     COMMAND DfgtAgentRecoveryPolicyTests)
+
+add_test(
+    NAME script-safety-invariants
+    COMMAND pwsh -NoLogo -NoProfile -NonInteractive
+        -File ${CMAKE_CURRENT_SOURCE_DIR}/tests/ScriptSafetyTests.ps1
+        -ScriptsDirectory ${CMAKE_CURRENT_SOURCE_DIR}/scripts)

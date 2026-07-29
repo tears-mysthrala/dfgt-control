@@ -82,6 +82,13 @@ function Remove-OwnedForceFeedbackRoot {
 }
 
 if ($PSCmdlet.ShouldProcess($resolvedInstallRoot, 'Remove DFGT user-mode FFB stack')) {
+    $presentDfgt = @(
+        Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue |
+            Where-Object InstanceId -like '*VID_046D&PID_C29A*'
+    )
+    if ($presentDfgt) {
+        throw 'Disconnect the DFGT before uninstall. No process or registration has been changed.'
+    }
     Get-CimInstance Win32_Process |
         Where-Object {
             $_.Name -in @('DfgtFfbBroker.exe', 'DfgtAgent.exe', 'DfgtControl.exe') -and

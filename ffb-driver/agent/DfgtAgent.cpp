@@ -398,7 +398,8 @@ private:
         while (!stop.stop_requested()) {
             const auto pipe = CreateNamedPipeW(
                 dfgt::agentui::PipeName,
-                PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+                PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE |
+                    FILE_FLAG_OVERLAPPED,
                 PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT |
                     PIPE_REJECT_REMOTE_CLIENTS,
                 1,

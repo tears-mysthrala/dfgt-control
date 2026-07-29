@@ -37,7 +37,8 @@ Uninstall verifies the manifest root and rejects recursive cleanup when
 unowned files exist. It stops only processes executing below that root. Run
 entries and shortcuts are removed only when their target matches the owned
 installation. Force-feedback roots are removed only when their CLSID is the
-project CLSID. Arbitrary `.reg` import is not supported.
+project CLSID. It refuses to stop anything until the DFGT is physically
+disconnected. Arbitrary `.reg` import is not supported.
 
 ## Legacy restore
 

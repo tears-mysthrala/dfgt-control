@@ -62,6 +62,7 @@ After reboot:
 Uninstall only removes objects owned by the DFGT Control manifest:
 
 ```powershell
+# Disconnect the DFGT first.
 .\scripts\Uninstall-DfgtFfb.ps1 -Confirm:$false
 ```
 
