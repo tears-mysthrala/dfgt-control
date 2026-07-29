@@ -156,11 +156,13 @@ $comChecks = @(
         else { $null }
         $activation = if ($RunComSmoke -and $exists -and
             (Test-Path -LiteralPath $smokePath -PathType Leaf)) {
-            & $smokePath $registeredPath 2>&1 | Out-String
+            $activationOutput =
+                & $smokePath $registeredPath 2>&1 | Out-String
             [ordered]@{
                 tested = $true
                 exitCode = $LASTEXITCODE
                 passed = $LASTEXITCODE -eq 0
+                output = $activationOutput.Trim()
             }
         }
         else {
@@ -281,8 +283,9 @@ $notTested = @(
     if (-not $RunComSmoke) {
         'DirectInput COM activation x64/x86'
     }
-    elseif ($comChecks | Where-Object {
-        -not $_.activation.tested -or -not $_.activation.passed }) {
+    elseif (@($comChecks | Where-Object {
+        -not $_.activation.tested -or
+        -not $_.activation.passed }).Count -gt 0) {
         'DirectInput COM activation x64/x86 did not pass'
     }
     if (-not $RunBrokerHandshake) {
