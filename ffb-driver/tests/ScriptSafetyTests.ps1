@@ -44,6 +44,12 @@ foreach ($entry in @(
     if ($maintenance -lt 0 -or $maintenance -gt $stop) {
         throw "$($entry.Name) does not attempt maintenance before process stop."
     }
+    $restartManager = $entry.Text.IndexOf(
+        'DfgtRestartManagerCheck.exe',
+        [StringComparison]::Ordinal)
+    if ($restartManager -lt 0 -or $restartManager -gt $stop) {
+        throw "$($entry.Name) does not inspect loaded providers before process stop."
+    }
 }
 if ($install -notmatch 'TargetUserSid' -or
     $install -notmatch 'Registry::HKEY_USERS') {

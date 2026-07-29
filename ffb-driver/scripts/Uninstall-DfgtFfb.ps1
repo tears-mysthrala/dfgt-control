@@ -96,6 +96,20 @@ if ($PSCmdlet.ShouldProcess($resolvedInstallRoot, 'Remove DFGT user-mode FFB sta
     if ($presentDfgt) {
         throw 'Disconnect the DFGT before uninstall. No process or registration has been changed.'
     }
+    $restartManager = Join-Path $resolvedInstallRoot `
+        'bin\x64\DfgtRestartManagerCheck.exe'
+    if (-not (Test-Path -LiteralPath $restartManager -PathType Leaf)) {
+        throw 'Owned Restart Manager checker is missing; uninstall aborted.'
+    }
+    & $restartManager `
+        (Join-Path $resolvedInstallRoot 'bin\x64\DfgtDirectInputFfb.dll') `
+        (Join-Path $resolvedInstallRoot 'bin\x86\DfgtDirectInputFfb.dll')
+    if ($LASTEXITCODE -eq 10) {
+        throw 'Restart Manager found a game using the DirectInput provider. Close it before uninstall.'
+    }
+    if ($LASTEXITCODE -ne 0) {
+        throw "Restart Manager inspection failed with exit code $LASTEXITCODE."
+    }
     $maintenanceTool = Join-Path $resolvedInstallRoot `
         'bin\x64\DfgtMaintenance.exe'
     $agentProcess = Get-CimInstance Win32_Process |

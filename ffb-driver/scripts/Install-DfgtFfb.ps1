@@ -155,6 +155,9 @@ $statusSmoke = Resolve-Artifact @(
 $maintenance = Resolve-Artifact @(
     'bin\x64\DfgtMaintenance.exe',
     'build-x64\Release\DfgtMaintenance.exe')
+$restartManager = Resolve-Artifact @(
+    'bin\x64\DfgtRestartManagerCheck.exe',
+    'build-x64\Release\DfgtRestartManagerCheck.exe')
 $agent = Resolve-Artifact @(
     'bin\x64\DfgtAgent.exe',
     'build-x64\Release\DfgtAgent.exe')
@@ -163,14 +166,14 @@ $ui = Resolve-Artifact @(
     'ui\publish\DfgtControl.exe')
 foreach ($artifact in @(
     $provider64, $provider32, $smoke64, $smoke32,
-    $broker, $statusSmoke, $maintenance, $agent, $ui)) {
+    $broker, $statusSmoke, $maintenance, $restartManager, $agent, $ui)) {
     if (-not (Test-Path -LiteralPath $artifact -PathType Leaf)) {
         throw "Required release artifact is missing: $artifact"
     }
 }
 foreach ($artifact in @(
     $provider64, $smoke64, $broker, $statusSmoke,
-    $maintenance, $agent, $ui)) {
+    $maintenance, $restartManager, $agent, $ui)) {
     Assert-PeArchitecture -Path $artifact -Architecture x64
 }
 foreach ($artifact in @($provider32, $smoke32)) {
@@ -255,6 +258,8 @@ $installedSmoke32 = Join-Path $bin32 'DfgtFfbComSmoke.exe'
 $installedBroker = Join-Path $bin64 'DfgtFfbBroker.exe'
 $installedStatusSmoke = Join-Path $bin64 'DfgtBrokerStatusSmoke.exe'
 $installedMaintenance = Join-Path $bin64 'DfgtMaintenance.exe'
+$installedRestartManager = Join-Path $bin64 `
+    'DfgtRestartManagerCheck.exe'
 $installedAgent = Join-Path $bin64 'DfgtAgent.exe'
 $installedUi = Join-Path $bin64 'DfgtControl.exe'
 $installedTransactionMarker = Join-Path $InstallRoot `
@@ -352,6 +357,8 @@ if ($PSCmdlet.ShouldProcess($InstallRoot, 'Install DFGT user-mode FFB stack and 
         -Destination (Join-Path $stageBin64 'DfgtBrokerStatusSmoke.exe')
     Copy-Item -LiteralPath $maintenance `
         -Destination (Join-Path $stageBin64 'DfgtMaintenance.exe')
+    Copy-Item -LiteralPath $restartManager `
+        -Destination (Join-Path $stageBin64 'DfgtRestartManagerCheck.exe')
     Copy-Item -LiteralPath $agent `
         -Destination (Join-Path $stageBin64 'DfgtAgent.exe')
     Copy-Item -LiteralPath $ui `
@@ -364,6 +371,7 @@ if ($PSCmdlet.ShouldProcess($InstallRoot, 'Install DFGT user-mode FFB stack and 
         @{ Source = $broker; Destination = (Join-Path $stageBin64 'DfgtFfbBroker.exe') },
         @{ Source = $statusSmoke; Destination = (Join-Path $stageBin64 'DfgtBrokerStatusSmoke.exe') },
         @{ Source = $maintenance; Destination = (Join-Path $stageBin64 'DfgtMaintenance.exe') },
+        @{ Source = $restartManager; Destination = (Join-Path $stageBin64 'DfgtRestartManagerCheck.exe') },
         @{ Source = $agent; Destination = (Join-Path $stageBin64 'DfgtAgent.exe') },
         @{ Source = $ui; Destination = (Join-Path $stageBin64 'DfgtControl.exe') }
     )) {
@@ -416,6 +424,13 @@ if ($PSCmdlet.ShouldProcess($InstallRoot, 'Install DFGT user-mode FFB stack and 
         )
         if ($presentDfgt) {
             throw 'Disconnect the DFGT before upgrade. No process has been stopped.'
+        }
+        & $restartManager $installedProvider64 $installedProvider32
+        if ($LASTEXITCODE -eq 10) {
+            throw 'Restart Manager found a game using the DirectInput provider. Close it before upgrade.'
+        }
+        if ($LASTEXITCODE -ne 0) {
+            throw "Restart Manager inspection failed with exit code $LASTEXITCODE."
         }
         $installedMaintenanceTool = Join-Path $resolvedInstallRoot `
             'bin\x64\DfgtMaintenance.exe'
@@ -553,6 +568,7 @@ if ($PSCmdlet.ShouldProcess($InstallRoot, 'Install DFGT user-mode FFB stack and 
             $installedBroker,
             $installedStatusSmoke,
             $installedMaintenance,
+            $installedRestartManager,
             $installedAgent,
             $installedUi,
             $installedTransactionMarker,

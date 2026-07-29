@@ -261,6 +261,19 @@ target_link_options(DfgtMaintenance PRIVATE
 set_target_properties(DfgtMaintenance PROPERTIES
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
+add_executable(DfgtRestartManagerCheck
+    tests/RestartManagerCheck.cpp)
+target_compile_features(DfgtRestartManagerCheck PRIVATE cxx_std_20)
+target_compile_definitions(DfgtRestartManagerCheck PRIVATE
+    UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_compile_options(DfgtRestartManagerCheck PRIVATE
+    /W4 /WX /permissive- /guard:cf)
+target_link_options(DfgtRestartManagerCheck PRIVATE
+    /guard:cf /DYNAMICBASE /NXCOMPAT)
+target_link_libraries(DfgtRestartManagerCheck PRIVATE Rstrtmgr)
+set_target_properties(DfgtRestartManagerCheck PROPERTIES
+    MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
 add_executable(DfgtAgent WIN32
     agent/DfgtAgent.cpp
     agent/ControlClient.cpp
