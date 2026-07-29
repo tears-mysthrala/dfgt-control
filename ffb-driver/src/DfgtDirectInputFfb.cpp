@@ -533,6 +533,10 @@ public:
             static_cast<unsigned long>(candidate.durationUs));
         if (FAILED(parseResult)) return parseResult;
         if (validateOnly) return S_OK;
+        if ((flags & DIEP_START) != 0 &&
+            HasPlayingSlotConflict(candidate, *handle)) {
+            return DIERR_DEVICEFULL;
+        }
         DWORD committedHandle = *handle;
         if (creating) {
             if (effects_.size() >= kMaximumEffects) return DIERR_DEVICEFULL;
@@ -611,6 +615,9 @@ public:
                 effect.hasDeadline = false;
                 effect.conditionStarted = false;
             }
+        } else if (HasPlayingSlotConflict(
+                       found->second, handle)) {
+            return DIERR_DEVICEFULL;
         }
         found->second.playing = true;
         ArmDeadline(found->second, iterations);
@@ -648,6 +655,28 @@ public:
     }
 
 private:
+    static int NativeConditionSlot(EffectKind kind) noexcept {
+        if (kind == EffectKind::Spring) return 1;
+        if (kind == EffectKind::Damper ||
+            kind == EffectKind::Inertia) return 2;
+        if (kind == EffectKind::Friction) return 3;
+        return 0;
+    }
+
+    bool HasPlayingSlotConflict(
+        const EffectState& candidate,
+        DWORD candidateHandle) const noexcept {
+        const auto slot = NativeConditionSlot(candidate.kind);
+        if (slot == 0) return false;
+        return std::ranges::any_of(
+            effects_,
+            [&](const auto& item) {
+                return item.first != candidateHandle &&
+                    item.second.playing &&
+                    NativeConditionSlot(item.second.kind) == slot;
+            });
+    }
+
     static HRESULT ParseEffect(
         DWORD effectId,
         const DIEFFECT& source,

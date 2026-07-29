@@ -107,6 +107,32 @@ int wmain(int argc, wchar_t** argv) {
         0, second, DIES_SOLO | 0x100, 1) ==
         DIERR_INVALIDPARAM, "invalid start mode");
 
+    DICONDITION condition{};
+    condition.lPositiveCoefficient = 1000;
+    condition.lNegativeCoefficient = -1000;
+    condition.dwPositiveSaturation = 10000;
+    condition.dwNegativeSaturation = 10000;
+    full.cbTypeSpecificParams = sizeof(condition);
+    full.lpvTypeSpecificParams = &condition;
+    DWORD springOne = 0;
+    DWORD springTwo = 0;
+    check(SUCCEEDED(driver->DownloadEffect(
+        0, 7, &springOne, &full, 0)), "first spring download");
+    check(SUCCEEDED(driver->DownloadEffect(
+        0, 7, &springTwo, &full, 0)), "second spring download");
+    driver->StartEffect(0, springOne, 0, INFINITE);
+    check(driver->StartEffect(
+        0, springTwo, 0, INFINITE) == DIERR_DEVICEFULL,
+        "same-slot condition was not rejected deterministically");
+    driver->StartEffect(0, springTwo, DIES_SOLO, INFINITE);
+    DWORD springOneStatus = DIEGES_PLAYING;
+    DWORD springTwoStatus = 0;
+    driver->GetEffectStatus(0, springOne, &springOneStatus);
+    driver->GetEffectStatus(0, springTwo, &springTwoStatus);
+    check((springOneStatus & DIEGES_PLAYING) == 0 &&
+        (springTwoStatus & DIEGES_PLAYING) != 0,
+        "DIES_SOLO did not transfer condition-slot ownership");
+
     driver->Release();
     FreeLibrary(module);
     if (!ok) {
