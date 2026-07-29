@@ -2,6 +2,7 @@
 #include <hidsdi.h>
 #include <hidpi.h>
 #include <sddl.h>
+#include <bcrypt.h>
 
 #include <algorithm>
 #include <array>
@@ -19,6 +20,8 @@
 #include "../shared/DfgtReports.h"
 #include "SafetyState.h"
 #include "EffectCoordinator.h"
+#include "LeaseWatchdog.h"
+#include "ClientProcessWatch.h"
 
 namespace {
 
@@ -486,11 +489,16 @@ struct BrokerState final {
 
 bool ReadMessageWithTimeout(
     HANDLE pipe,
+    const dfgt::broker::ClientProcessWatch& clientProcess,
     dfgt::ipc::Message& message,
     bool forceActive,
     ULONGLONG leaseDeadline,
     BrokerState& state) {
     for (;;) {
+        if (clientProcess.Terminated()) {
+            SetLastError(ERROR_PROCESS_ABORTED);
+            return false;
+        }
         HRESULT rangeLockResult = S_OK;
         {
             std::scoped_lock lock(state.mutex);
@@ -785,6 +793,30 @@ int RunClient(
     BrokerState& state,
     bool diagnostics,
     bool suppressForceWrites) {
+    ULONG clientPid = 0;
+    ULONG clientSession = 0;
+    GetNamedPipeClientProcessId(pipe, &clientPid);
+    GetNamedPipeClientSessionId(pipe, &clientSession);
+    dfgt::broker::ClientProcessWatch clientProcess(clientPid);
+    std::uint64_t sessionNonce = 0;
+    const auto nonceResult = BCryptGenRandom(
+        nullptr,
+        reinterpret_cast<PUCHAR>(&sessionNonce),
+        sizeof(sessionNonce),
+        BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    if (nonceResult < 0) sessionNonce = 0;
+    if (clientPid == 0 || !clientProcess.Valid() ||
+        sessionNonce == 0) {
+        std::scoped_lock lock(state.mutex);
+        state.lastResult = HRESULT_FROM_WIN32(ERROR_ACCESS_DENIED);
+        ++state.failSafeCount;
+        return 1;
+    }
+    std::wcout
+        << L"{\"event\":\"ffb-session-open\",\"pid\":"
+        << clientPid << L",\"session\":" << clientSession
+        << L",\"nonce\":" << sessionNonce << L"}\n"
+        << std::flush;
     bool opened = false;
     bool forceActive = false;
     std::uint64_t sessionGeneration = 0;
@@ -794,11 +826,16 @@ int RunClient(
     std::int32_t maximumAbsoluteConstant = 0;
     std::uint64_t stopAllCount = 0;
     std::uint64_t heartbeatCount = 0;
+    dfgt::broker::LeaseWatchdog watchdog{
+        std::chrono::milliseconds(kReadTimeoutMs)};
+    const auto watchdogStart = std::chrono::steady_clock::now();
+    watchdog.Reset(watchdogStart);
     ULONGLONG leaseDeadline = GetTickCount64() + kReadTimeoutMs;
     for (;;) {
         dfgt::ipc::Message message{};
         if (!ReadMessageWithTimeout(
                 pipe,
+                clientProcess,
                 message,
                 forceActive,
                 leaseDeadline,
@@ -833,6 +870,12 @@ int RunClient(
             forceActive,
             sessionGeneration,
             suppressForceWrites);
+        {
+            std::scoped_lock lock(state.mutex);
+            forceActive =
+                state.safety.ActiveSlots() !=
+                dfgt::broker::PhysicalSlot::None;
+        }
         if (diagnostics &&
             message.command != dfgt::ipc::Command::Heartbeat) {
             std::wcout
@@ -858,13 +901,23 @@ int RunClient(
         } else if (message.command == dfgt::ipc::Command::Heartbeat) {
             ++heartbeatCount;
         }
-        if (SUCCEEDED(result) && forceActive &&
+        const auto now = std::chrono::steady_clock::now();
+        const auto rendererProgressed =
+            message.command != dfgt::ipc::Command::Heartbeat ||
+            watchdog.ObserveRenderer(message.renderEpoch, now);
+        if (SUCCEEDED(result) && forceActive && rendererProgressed &&
             (message.command == dfgt::ipc::Command::Constant ||
              message.command == dfgt::ipc::Command::Spring ||
              message.command == dfgt::ipc::Command::Damper ||
              message.command == dfgt::ipc::Command::Friction ||
              message.command == dfgt::ipc::Command::Heartbeat)) {
-            leaseDeadline = GetTickCount64() + kReadTimeoutMs;
+            if (message.command != dfgt::ipc::Command::Heartbeat) {
+                watchdog.ObserveForceCommand(now);
+            }
+            leaseDeadline = GetTickCount64() +
+                static_cast<ULONGLONG>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        watchdog.Deadline() - now).count());
         } else if (!forceActive) {
             leaseDeadline = GetTickCount64() + kReadTimeoutMs;
         }

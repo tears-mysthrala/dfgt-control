@@ -45,7 +45,7 @@ target_compile_definitions(DfgtFfbBroker PRIVATE
     NOMINMAX)
 target_compile_options(DfgtFfbBroker PRIVATE /W4 /WX /permissive- /guard:cf)
 target_link_options(DfgtFfbBroker PRIVATE /guard:cf /DYNAMICBASE /NXCOMPAT)
-target_link_libraries(DfgtFfbBroker PRIVATE hid advapi32)
+target_link_libraries(DfgtFfbBroker PRIVATE hid advapi32 bcrypt)
 set_target_properties(DfgtFfbBroker PROPERTIES
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
@@ -102,6 +102,29 @@ target_link_options(DfgtEffectCoordinatorTests PRIVATE
 set_target_properties(DfgtEffectCoordinatorTests PROPERTIES
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 add_test(NAME effect-slot-isolation COMMAND DfgtEffectCoordinatorTests)
+
+add_executable(DfgtLeaseWatchdogTests tests/LeaseWatchdogTests.cpp)
+target_compile_features(DfgtLeaseWatchdogTests PRIVATE cxx_std_20)
+target_compile_options(DfgtLeaseWatchdogTests PRIVATE
+    /W4 /WX /permissive- /guard:cf)
+target_link_options(DfgtLeaseWatchdogTests PRIVATE
+    /guard:cf /DYNAMICBASE /NXCOMPAT)
+set_target_properties(DfgtLeaseWatchdogTests PROPERTIES
+    MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+add_test(NAME renderer-lease-watchdog COMMAND DfgtLeaseWatchdogTests)
+
+add_executable(DfgtClientProcessWatchTests
+    tests/ClientProcessWatchTests.cpp)
+target_compile_features(DfgtClientProcessWatchTests PRIVATE cxx_std_20)
+target_compile_definitions(DfgtClientProcessWatchTests PRIVATE
+    UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_compile_options(DfgtClientProcessWatchTests PRIVATE
+    /W4 /WX /permissive- /guard:cf)
+target_link_options(DfgtClientProcessWatchTests PRIVATE
+    /guard:cf /DYNAMICBASE /NXCOMPAT)
+set_target_properties(DfgtClientProcessWatchTests PROPERTIES
+    MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+add_test(NAME client-process-watch COMMAND DfgtClientProcessWatchTests)
 
 add_executable(DfgtBrokerRangeSmoke tests/BrokerRangeSmoke.cpp)
 target_compile_features(DfgtBrokerRangeSmoke PRIVATE cxx_std_20)

@@ -96,7 +96,7 @@ public:
         : heartbeat_([this](std::stop_token stop) { HeartbeatLoop(stop); }) {}
 
     ~BrokerTransport() {
-        active_ = false;
+        activeSlots_ = 0;
         heartbeat_.request_stop();
         heartbeatWake_.notify_all();
         StopAll();
@@ -143,7 +143,7 @@ public:
     }
 
     void Close() noexcept {
-        active_ = false;
+        activeSlots_ = 0;
         std::scoped_lock lock(mutex_);
         if (pipe_ == INVALID_HANDLE_VALUE) return;
         dfgt::ipc::Message message{};
@@ -162,21 +162,23 @@ public:
         message.auxiliary =
             std::clamp(periodicMagnitude, -10000, 10000);
         const auto result = Send(message);
-        active_ = SUCCEEDED(result) &&
-            (magnitude != 0 || periodicMagnitude != 0);
+        if (SUCCEEDED(result)) {
+            SetSlot(kSoftwareSlot,
+                magnitude != 0 || periodicMagnitude != 0);
+        }
         heartbeatWake_.notify_all();
         return result;
     }
 
     HRESULT StopSlotOne() noexcept {
-        active_ = false;
+        SetSlot(kSoftwareSlot, false);
         dfgt::ipc::Message message{};
         message.command = dfgt::ipc::Command::StopSoftwareSlot;
         return Send(message);
     }
 
     HRESULT StopAll() noexcept {
-        active_ = false;
+        activeSlots_ = 0;
         dfgt::ipc::Message message{};
         message.command = dfgt::ipc::Command::StopAll;
         return Send(message);
@@ -206,12 +208,36 @@ public:
         message.value6 = static_cast<std::int32_t>(
             std::min<DWORD>(positiveSaturation, 10000));
         const auto result = Send(message);
-        active_ = SUCCEEDED(result);
+        if (SUCCEEDED(result)) {
+            const auto slot = command == dfgt::ipc::Command::Spring
+                ? kSpringSlot
+                : command == dfgt::ipc::Command::Friction
+                    ? kFrictionSlot
+                    : kDamperSlot;
+            SetSlot(slot, true);
+        }
         heartbeatWake_.notify_all();
         return result;
     }
 
+    void UpdateRenderEpoch(std::uint64_t epoch) noexcept {
+        renderEpoch_.store(epoch, std::memory_order_release);
+    }
+
 private:
+    static constexpr std::uint32_t kSoftwareSlot = 1u << 0;
+    static constexpr std::uint32_t kSpringSlot = 1u << 1;
+    static constexpr std::uint32_t kDamperSlot = 1u << 2;
+    static constexpr std::uint32_t kFrictionSlot = 1u << 3;
+
+    void SetSlot(std::uint32_t slot, bool active) noexcept {
+        if (active) {
+            activeSlots_.fetch_or(slot);
+        } else {
+            activeSlots_.fetch_and(~slot);
+        }
+    }
+
     HRESULT Send(dfgt::ipc::Message& message) noexcept {
         std::scoped_lock lock(mutex_);
         return SendLocked(message);
@@ -246,16 +272,19 @@ private:
         std::unique_lock waitLock(waitMutex);
         while (!stop.stop_requested()) {
             heartbeatWake_.wait_for(waitLock, std::chrono::milliseconds(100));
-            if (stop.stop_requested() || !active_) continue;
+            if (stop.stop_requested() || activeSlots_.load() == 0) continue;
             dfgt::ipc::Message message{};
             message.command = dfgt::ipc::Command::Heartbeat;
-            if (FAILED(Send(message))) active_ = false;
+            message.renderEpoch =
+                renderEpoch_.load(std::memory_order_acquire);
+            if (FAILED(Send(message))) activeSlots_ = 0;
         }
     }
 
     HANDLE pipe_{INVALID_HANDLE_VALUE};
     std::mutex mutex_;
-    std::atomic<bool> active_{false};
+    std::atomic<std::uint32_t> activeSlots_{0};
+    std::atomic<std::uint64_t> renderEpoch_{0};
     std::uint32_t sequence_{};
     std::condition_variable heartbeatWake_;
     std::jthread heartbeat_;
@@ -968,6 +997,7 @@ private:
                 }
                 if (rerenderConditions) RenderEverythingLocked(now);
                 else RenderAllLocked(now);
+                transport_.UpdateRenderEpoch(++renderEpoch_);
             }
         }
     }
@@ -983,6 +1013,7 @@ private:
     bool paused_{};
     std::int32_t lastRendered_{};
     std::int32_t lastPeriodicRendered_{};
+    std::uint64_t renderEpoch_{};
     std::condition_variable timerWake_;
     std::jthread timer_;
 };

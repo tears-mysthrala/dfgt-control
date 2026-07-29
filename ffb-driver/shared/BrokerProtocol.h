@@ -9,7 +9,7 @@ inline constexpr wchar_t PipeName[] = LR"(\\.\pipe\DfgtFfbBroker.v1)";
 inline constexpr wchar_t ControlPipeName[] =
     LR"(\\.\pipe\DfgtFfbBroker.control.v1)";
 inline constexpr std::uint32_t Magic = 0x54474644; // "DFGT" little-endian
-inline constexpr std::uint16_t Version = 2;
+inline constexpr std::uint16_t Version = 3;
 inline constexpr std::size_t DevicePathCharacters = 512;
 
 enum class Command : std::uint32_t {
@@ -37,6 +37,7 @@ struct Message {
     std::int32_t value4{};
     std::int32_t value5{};
     std::int32_t value6{};
+    std::uint64_t renderEpoch{};
     wchar_t devicePath[DevicePathCharacters]{};
 };
 
