@@ -1,5 +1,7 @@
 #include <windows.h>
 #include <shellapi.h>
+#include <dbt.h>
+#include <hidsdi.h>
 
 #include <algorithm>
 #include <filesystem>
@@ -71,6 +73,7 @@ public:
     int Run(HINSTANCE instance) {
         instance_ = instance;
         if (!InitialiseWindow()) return 10;
+        RegisterForDeviceChanges();
         if (!InitialiseControl()) {
             UpdateTray(L"DFGT Control · broker no disponible");
         }
@@ -161,12 +164,16 @@ private:
     }
 
     bool ConnectDevice() {
+        if (GetTickCount64() < nextAttachAttempt_) return false;
         if (FAILED(EnsureBroker())) return false;
         const auto path = dfgt::agent::FindDfgtDevicePath();
         if (!path || FAILED(control_.AttachDevice(*path))) {
             UpdateTray(L"DFGT Control · volante desconectado");
+            nextAttachAttempt_ = GetTickCount64() + 2000;
             return true;
         }
+        nextAttachAttempt_ = 0;
+        brokerBackoffMs_ = 500;
         ApplyProfile(profiles_.front());
         return true;
     }
@@ -190,12 +197,43 @@ private:
             control_.Close();
             activeProfile_.clear();
             ConnectDevice();
+        } else if (
+            status.state ==
+                dfgt::ipc::control::DeviceState::Disconnected ||
+            status.state ==
+                dfgt::ipc::control::DeviceState::Faulted) {
+            activeProfile_.clear();
+            ConnectDevice();
+        } else if (
+            status.safetyMode ==
+                static_cast<std::uint32_t>(
+                    dfgt::ipc::SafetyMode::EmergencyLatched)) {
+            UpdateTray(L"DFGT Control · PARADA ENCLAVADA");
+        } else if (
+            status.safetyMode ==
+                static_cast<std::uint32_t>(
+                    dfgt::ipc::SafetyMode::StopUnconfirmed)) {
+            UpdateTray(
+                L"DFGT Control · PARADA NO CONFIRMADA: "
+                L"DESCONECTA EL VOLANTE");
+        }
+        if (hook_ == nullptr) {
+            ApplyForegroundProfile();
         }
     }
 
     HRESULT EnsureBroker() {
         auto result = control_.Connect();
-        if (SUCCEEDED(result)) return result;
+        if (SUCCEEDED(result)) {
+            brokerBackoffMs_ = 500;
+            nextBrokerAttempt_ = 0;
+            return result;
+        }
+        const auto now = GetTickCount64();
+        if (now < nextBrokerAttempt_) return result;
+        nextBrokerAttempt_ = now + brokerBackoffMs_;
+        brokerBackoffMs_ = std::min<DWORD>(
+            brokerBackoffMs_ * 2, 30000);
         const auto broker =
             ModuleDirectory() + L"\\DfgtFfbBroker.exe";
         STARTUPINFOW startup{};
@@ -221,7 +259,11 @@ private:
         do {
             Sleep(100);
             result = control_.Connect();
-            if (SUCCEEDED(result)) return result;
+            if (SUCCEEDED(result)) {
+                brokerBackoffMs_ = 500;
+                nextBrokerAttempt_ = 0;
+                return result;
+            }
         } while (GetTickCount64() < deadline);
         return result;
     }
@@ -310,7 +352,24 @@ private:
         Shell_NotifyIconW(NIM_MODIFY, &tray_);
     }
 
+    void RegisterForDeviceChanges() {
+        GUID hidGuid{};
+        HidD_GetHidGuid(&hidGuid);
+        DEV_BROADCAST_DEVICEINTERFACE_W filter{};
+        filter.dbcc_size = sizeof(filter);
+        filter.dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE;
+        filter.dbcc_classguid = hidGuid;
+        deviceNotification_ = RegisterDeviceNotificationW(
+            window_,
+            &filter,
+            DEVICE_NOTIFY_WINDOW_HANDLE);
+    }
+
     void Shutdown() {
+        if (deviceNotification_ != nullptr) {
+            UnregisterDeviceNotification(deviceNotification_);
+            deviceNotification_ = nullptr;
+        }
         if (hook_ != nullptr) UnhookWinEvent(hook_);
         control_.DetachDevice();
         control_.Close();
@@ -324,6 +383,34 @@ private:
         WPARAM wParam,
         LPARAM lParam) {
         switch (message) {
+        case WM_DEVICECHANGE:
+            if (wParam == DBT_DEVICEARRIVAL ||
+                wParam == DBT_DEVICEREMOVECOMPLETE) {
+                nextAttachAttempt_ = 0;
+                activeProfile_.clear();
+                ConnectDevice();
+            }
+            return TRUE;
+        case WM_POWERBROADCAST:
+            if (wParam == PBT_APMSUSPEND) {
+                control_.DetachDevice();
+                activeProfile_.clear();
+            } else if (
+                wParam == PBT_APMRESUMEAUTOMATIC ||
+                wParam == PBT_APMRESUMESUSPEND) {
+                nextAttachAttempt_ = 0;
+                ConnectDevice();
+            }
+            return TRUE;
+        case WM_QUERYENDSESSION:
+            control_.DetachDevice();
+            return TRUE;
+        case WM_ENDSESSION:
+            if (wParam != FALSE) {
+                control_.DetachDevice();
+                control_.Close();
+            }
+            return 0;
         case kTrayMessage:
             if (LOWORD(lParam) == WM_LBUTTONDBLCLK) {
                 OpenUserInterface();
@@ -450,12 +537,16 @@ private:
     HINSTANCE instance_{nullptr};
     HWND window_{nullptr};
     HWINEVENTHOOK hook_{nullptr};
+    HDEVNOTIFY deviceNotification_{nullptr};
     NOTIFYICONDATAW tray_{};
     dfgt::agent::ControlClient control_;
     dfgt::agent::ProfileStore store_;
     std::vector<dfgt::agent::ProfileModel> profiles_;
     std::wstring activeProfile_;
     FILETIME profileWriteTime_{};
+    ULONGLONG nextBrokerAttempt_{};
+    ULONGLONG nextAttachAttempt_{};
+    DWORD brokerBackoffMs_{500};
 };
 
 } // namespace
