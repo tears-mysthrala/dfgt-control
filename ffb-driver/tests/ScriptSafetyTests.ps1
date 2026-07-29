@@ -115,5 +115,13 @@ if ($statusSmoke -match 'AttachDevice|ApplyProfile|EmergencyStop|SetRange' -or
     $statusSmoke -notmatch 'Command::GetStatus') {
     throw 'Broker status smoke is not strictly read-only.'
 }
+$brokerPath = Join-Path (Split-Path -Parent $ScriptsDirectory) `
+    'broker\DfgtFfbBroker.cpp'
+$broker = Get-Content -LiteralPath $brokerPath -Raw
+if ($broker -notmatch 'Command::PrepareForMaintenance' -or
+    $broker -notmatch 'if \(!state\.device\.IsOpen\(\)\)' -or
+    $broker -notmatch 'EnterMaintenanceSafe') {
+    throw 'Maintenance does not handle an already-disconnected device safely.'
+}
 
 Write-Output 'script safety invariants passed'

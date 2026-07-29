@@ -1384,10 +1384,15 @@ HRESULT ProcessControlRequest(
         HRESULT rangeResult = E_FAIL;
         {
             std::scoped_lock lock(state.deviceMutex);
-            stopResult = state.device.StopAll();
-            rangeResult = SUCCEEDED(stopResult)
-                ? state.device.SetRange(900)
-                : stopResult;
+            if (!state.device.IsOpen()) {
+                stopResult = S_OK;
+                rangeResult = S_OK;
+            } else {
+                stopResult = state.device.StopAll();
+                rangeResult = SUCCEEDED(stopResult)
+                    ? state.device.SetRange(900)
+                    : stopResult;
+            }
             if (SUCCEEDED(stopResult) &&
                 SUCCEEDED(rangeResult)) {
                 state.device.Close();
