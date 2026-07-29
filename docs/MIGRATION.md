@@ -62,7 +62,17 @@ Uninstall only removes objects owned by the DFGT Control manifest:
 .\scripts\Uninstall-DfgtFfb.ps1 -Confirm:$false
 ```
 
-Registry backups and exported driver packages are stored under
-`%PROGRAMDATA%\DfgtControl\backups`. Restore only the exact backup created for
-the affected machine. Windows Update or a vendor installer may be safer than
-restoring an old package on a different Windows build.
+Legacy snapshots and exported driver packages are stored under
+`%PROGRAMDATA%\DfgtControl\legacy-backups`. Restore accepts only a schema 3
+snapshot whose machine GUID, user SID, hardware ID and file hashes match:
+
+```powershell
+.\scripts\Restore-LogitechLegacyStack.ps1 `
+  -BackupDirectory $backup.backupDirectory `
+  -Execute `
+  -Confirm:$false
+```
+
+The restore script reinstalls only the verified driver INFs with `pnputil`; it
+never imports arbitrary `.reg` files. Windows Update or a vendor installer may
+be safer than restoring an old package after a major Windows change.

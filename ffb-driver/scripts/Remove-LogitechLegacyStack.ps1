@@ -35,7 +35,7 @@ if (-not (Test-Path $snapshotPath -PathType Leaf)) {
     throw "Backup snapshot is missing: $snapshotPath"
 }
 $snapshot = Get-Content $snapshotPath -Raw | ConvertFrom-Json
-if ($snapshot.schemaVersion -ne 2 -or
+if ($snapshot.schemaVersion -notin @(2, 3) -or
     $snapshot.dfgtHardwareId -ne 'VID_046D&PID_C29A') {
     throw 'Unsupported or mismatched backup snapshot.'
 }

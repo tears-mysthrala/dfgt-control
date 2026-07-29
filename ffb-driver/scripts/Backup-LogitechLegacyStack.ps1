@@ -112,15 +112,32 @@ foreach ($item in $registryExports) {
     }
 }
 
+$registryEvidence = @(
+    Get-ChildItem -LiteralPath $registry -File -Filter '*.reg' |
+        ForEach-Object {
+            [ordered]@{
+                file = $_.Name
+                length = $_.Length
+                sha256 = (Get-FileHash $_.FullName -Algorithm SHA256).Hash
+            }
+        }
+)
+$machineGuid = (Get-ItemProperty `
+    'HKLM:\SOFTWARE\Microsoft\Cryptography' -Name MachineGuid).MachineGuid
+$windowsBuild = [Environment]::OSVersion.Version.Build
 $snapshot = [ordered]@{
-    schemaVersion = 2
+    schemaVersion = 3
     capturedAt = (Get-Date).ToString('o')
     computer = $env:COMPUTERNAME
     account = $identity.Name
+    accountSid = $identity.User.Value
+    machineGuid = $machineGuid
+    windowsBuild = $windowsBuild
     backupDirectory = $backup
     dfgtHardwareId = 'VID_046D&PID_C29A'
     dfgtPackages = $packageNames
     packageEvidence = $packageEvidence
+    registryEvidence = $registryEvidence
     dfgtDevices = @($dfgtDrivers | Select-Object DeviceName, DeviceID,
         InfName, DriverVersion, DriverProviderName)
 }

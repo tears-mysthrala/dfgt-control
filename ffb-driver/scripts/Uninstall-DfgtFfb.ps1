@@ -1,7 +1,6 @@
 [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
 param(
-    [string]$InstallRoot = (Join-Path $env:ProgramFiles 'DfgtControl'),
-    [string[]]$RestoreRegistryBackup
+    [string]$InstallRoot = (Join-Path $env:ProgramFiles 'DfgtControl')
 )
 
 $ErrorActionPreference = 'Stop'
@@ -55,22 +54,6 @@ if ($unexpectedFiles) {
     throw "Refusing recursive cleanup because unowned files exist: $($unexpectedFiles.FullName -join ', ')"
 }
 
-if ($RestoreRegistryBackup) {
-    $resolvedBackups = @(
-        foreach ($registryBackup in $RestoreRegistryBackup) {
-            $resolvedBackup = [IO.Path]::GetFullPath($registryBackup)
-            if (-not (Test-Path -LiteralPath $resolvedBackup -PathType Leaf) -or
-                [IO.Path]::GetExtension($resolvedBackup) -ne '.reg') {
-                throw "Registry backup is missing or is not a .reg file: $resolvedBackup"
-            }
-            $resolvedBackup
-        }
-    )
-}
-else {
-    $resolvedBackups = @()
-}
-
 function Remove-OwnedForceFeedbackRoot {
     param([Parameter(Mandatory)][string]$Path)
 
@@ -116,13 +99,6 @@ if ($PSCmdlet.ShouldProcess($resolvedInstallRoot, 'Remove DFGT user-mode FFB sta
         }
     }
 
-    foreach ($resolvedBackup in $resolvedBackups) {
-        & reg.exe import $resolvedBackup | Out-Null
-        if ($LASTEXITCODE -ne 0) {
-            throw "Registry backup import failed: $resolvedBackup"
-        }
-    }
-
     foreach ($ownedFile in $ownedFiles) {
         Remove-Item -LiteralPath $ownedFile -Force -ErrorAction SilentlyContinue
     }
@@ -142,5 +118,6 @@ if ($PSCmdlet.ShouldProcess($resolvedInstallRoot, 'Remove DFGT user-mode FFB sta
 [pscustomobject]@{
     removed = -not [bool]$WhatIfPreference
     installRoot = $resolvedInstallRoot
-    restoredRegistryBackups = $resolvedBackups.Count
+    restoredRegistryBackups = 0
+    legacyRestore = 'Use Restore-LogitechLegacyStack.ps1 with a verified schema 3 project snapshot.'
 } | ConvertTo-Json
