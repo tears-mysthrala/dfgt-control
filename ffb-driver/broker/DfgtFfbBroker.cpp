@@ -17,6 +17,7 @@
 #include "../shared/BrokerProtocol.h"
 #include "../shared/DfgtReports.h"
 #include "SafetyState.h"
+#include "EffectCoordinator.h"
 
 namespace {
 
@@ -27,7 +28,7 @@ constexpr std::uint32_t kRangeLockEngageHigh = 16127;
 constexpr std::uint32_t kRangeLockReleaseHigh = 15359;
 constexpr std::int32_t kRangeLockMagnitude = 3000;
 
-class HidDevice final {
+class HidDevice final : public dfgt::broker::IEffectDevice {
 public:
     ~HidDevice() { Close(); }
 
@@ -543,24 +544,10 @@ HRESULT ProcessMessage(
         if (suppressForceWrites) return S_OK;
         {
             std::scoped_lock lock(state.mutex);
-            if (forceActive) {
-                const auto allowed = state.safety.CanAcceptForce();
-                if (FAILED(allowed)) return allowed;
-            }
-            const auto result = forceActive
-                ? state.device.Constant(message.value, message.auxiliary)
-                : state.device.StopSoftwareSlot();
-            if (SUCCEEDED(result)) {
-                if (forceActive) {
-                    state.safety.Activate(
-                        dfgt::broker::PhysicalSlot::Software);
-                } else {
-                    state.safety.ConfirmSlotStopped(
-                        dfgt::broker::PhysicalSlot::Software);
-                }
-            } else {
-                state.safety.MarkStopUnconfirmed(result);
-            }
+            dfgt::broker::EffectCoordinator effects(
+                state.device, state.safety);
+            const auto result =
+                effects.SetSoftware(message.value, message.auxiliary);
             state.lastResult = result;
             return result;
         }
@@ -568,13 +555,9 @@ HRESULT ProcessMessage(
         forceActive = false;
         {
             std::scoped_lock lock(state.mutex);
-            const auto result = state.device.StopSoftwareSlot();
-            if (SUCCEEDED(result)) {
-                state.safety.ConfirmSlotStopped(
-                    dfgt::broker::PhysicalSlot::Software);
-            } else {
-                state.safety.MarkStopUnconfirmed(result);
-            }
+            dfgt::broker::EffectCoordinator effects(
+                state.device, state.safety);
+            const auto result = effects.StopSoftware();
             state.lastResult = result;
             return result;
         }
@@ -611,18 +594,12 @@ HRESULT ProcessMessage(
         if (suppressForceWrites) return S_OK;
         {
             std::scoped_lock lock(state.mutex);
-            const auto allowed = state.safety.CanAcceptForce();
-            if (FAILED(allowed)) return allowed;
-            const auto result = state.device.Spring(
-            message.value,
-            message.auxiliary,
-            message.value3,
-            message.value4,
-            message.value5,
-            message.value6);
-            if (SUCCEEDED(result)) {
-                state.safety.Activate(dfgt::broker::PhysicalSlot::Spring);
-            }
+            dfgt::broker::EffectCoordinator effects(
+                state.device, state.safety);
+            const auto result = effects.SetSpring(
+                message.value, message.auxiliary,
+                message.value3, message.value4,
+                message.value5, message.value6);
             state.lastResult = result;
             return result;
         }
@@ -635,17 +612,11 @@ HRESULT ProcessMessage(
         if (suppressForceWrites) return S_OK;
         {
             std::scoped_lock lock(state.mutex);
-            const auto allowed = state.safety.CanAcceptForce();
-            if (FAILED(allowed)) return allowed;
-            const auto result = state.device.Damper(
-            message.value,
-            message.auxiliary,
-            message.value5,
-            message.value6);
-            if (SUCCEEDED(result)) {
-                state.safety.Activate(
-                    dfgt::broker::PhysicalSlot::DamperOrInertia);
-            }
+            dfgt::broker::EffectCoordinator effects(
+                state.device, state.safety);
+            const auto result = effects.SetDamper(
+                message.value, message.auxiliary,
+                message.value5, message.value6);
             state.lastResult = result;
             return result;
         }
@@ -658,16 +629,11 @@ HRESULT ProcessMessage(
         if (suppressForceWrites) return S_OK;
         {
             std::scoped_lock lock(state.mutex);
-            const auto allowed = state.safety.CanAcceptForce();
-            if (FAILED(allowed)) return allowed;
-            const auto result = state.device.Friction(
-            message.value,
-            message.auxiliary,
-            message.value5,
-            message.value6);
-            if (SUCCEEDED(result)) {
-                state.safety.Activate(dfgt::broker::PhysicalSlot::Friction);
-            }
+            dfgt::broker::EffectCoordinator effects(
+                state.device, state.safety);
+            const auto result = effects.SetFriction(
+                message.value, message.auxiliary,
+                message.value5, message.value6);
             state.lastResult = result;
             return result;
         }

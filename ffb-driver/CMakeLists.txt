@@ -90,6 +90,19 @@ set_target_properties(DfgtSafetyStateTests PROPERTIES
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 add_test(NAME safety-state-machine COMMAND DfgtSafetyStateTests)
 
+add_executable(DfgtEffectCoordinatorTests
+    tests/EffectCoordinatorTests.cpp)
+target_compile_features(DfgtEffectCoordinatorTests PRIVATE cxx_std_20)
+target_compile_definitions(DfgtEffectCoordinatorTests PRIVATE
+    UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_compile_options(DfgtEffectCoordinatorTests PRIVATE
+    /W4 /WX /permissive- /guard:cf)
+target_link_options(DfgtEffectCoordinatorTests PRIVATE
+    /guard:cf /DYNAMICBASE /NXCOMPAT)
+set_target_properties(DfgtEffectCoordinatorTests PROPERTIES
+    MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+add_test(NAME effect-slot-isolation COMMAND DfgtEffectCoordinatorTests)
+
 add_executable(DfgtBrokerRangeSmoke tests/BrokerRangeSmoke.cpp)
 target_compile_features(DfgtBrokerRangeSmoke PRIVATE cxx_std_20)
 target_compile_definitions(DfgtBrokerRangeSmoke PRIVATE
