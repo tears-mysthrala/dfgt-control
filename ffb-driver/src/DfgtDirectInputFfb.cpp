@@ -446,13 +446,17 @@ public:
             "DeviceID begin=%lu externalId=%lu",
             static_cast<unsigned long>(begin),
             static_cast<unsigned long>(externalId));
-        std::scoped_lock lock(stateMutex_);
         if (begin == 0) {
-            transport_.StopAll();
-            lastRendered_ = 0;
+            {
+                std::scoped_lock lock(stateMutex_);
+                lastRendered_ = 0;
+                lastPeriodicRendered_ = 0;
+                effects_.clear();
+                externalId_ = 0;
+            }
+            const auto stopped = transport_.StopAll();
             transport_.Close();
-            effects_.clear();
-            externalId_ = 0;
+            if (FAILED(stopped)) return stopped;
             return S_OK;
         }
         if (initInfo == nullptr) return E_INVALIDARG;
@@ -462,9 +466,12 @@ public:
         }
         const auto result = transport_.Open(info->pwszDeviceInterface);
         if (FAILED(result)) return result;
-        externalId_ = externalId;
-        actuatorsEnabled_ = true;
-        paused_ = false;
+        {
+            std::scoped_lock lock(stateMutex_);
+            externalId_ = externalId;
+            actuatorsEnabled_ = true;
+            paused_ = false;
+        }
         return transport_.StopAll();
     }
 
@@ -488,9 +495,11 @@ public:
             static_cast<unsigned long>(externalId),
             static_cast<unsigned long>(gain));
         if (!Matches(externalId) || gain > 10000) return E_INVALIDARG;
-        std::scoped_lock lock(stateMutex_);
-        globalGain_ = gain;
-        return RenderEverythingLocked(std::chrono::steady_clock::now());
+        {
+            std::scoped_lock lock(stateMutex_);
+            globalGain_ = gain;
+        }
+        return RenderEverything(std::chrono::steady_clock::now());
     }
 
     HRESULT STDMETHODCALLTYPE SendForceFeedbackCommand(DWORD externalId, DWORD command) override {
@@ -499,12 +508,13 @@ public:
             static_cast<unsigned long>(externalId),
             static_cast<unsigned long>(command));
         if (!Matches(externalId)) return E_INVALIDARG;
-        std::scoped_lock lock(stateMutex_);
+        std::unique_lock lock(stateMutex_);
         switch (command) {
         case DISFFC_RESET:
             effects_.clear();
             paused_ = false;
             lastRendered_ = 0;
+            lock.unlock();
             return transport_.StopAll();
         case DISFFC_STOPALL:
             for (auto& [_, effect] : effects_) {
@@ -513,20 +523,25 @@ public:
             }
             paused_ = false;
             lastRendered_ = 0;
+            lock.unlock();
             return transport_.StopAll();
         case DISFFC_PAUSE:
             paused_ = true;
             lastRendered_ = 0;
+            lock.unlock();
             return transport_.StopAll();
         case DISFFC_CONTINUE:
             paused_ = false;
-            return RenderEverythingLocked(std::chrono::steady_clock::now());
+            lock.unlock();
+            return RenderEverything(std::chrono::steady_clock::now());
         case DISFFC_SETACTUATORSON:
             actuatorsEnabled_ = true;
-            return RenderEverythingLocked(std::chrono::steady_clock::now());
+            lock.unlock();
+            return RenderEverything(std::chrono::steady_clock::now());
         case DISFFC_SETACTUATORSOFF:
             actuatorsEnabled_ = false;
             lastRendered_ = 0;
+            lock.unlock();
             return transport_.StopAll();
         default:
             return E_INVALIDARG;
@@ -539,15 +554,23 @@ public:
         if (!Matches(externalId) || state == nullptr || state->dwSize < sizeof(DIDEVICESTATE)) {
             return E_INVALIDARG;
         }
-        std::scoped_lock lock(stateMutex_);
         state->dwState = 0;
-        if (paused_) state->dwState |= DIGFFS_PAUSED;
+        bool paused = false;
+        bool actuatorsEnabled = false;
+        std::size_t effectCount = 0;
+        {
+            std::scoped_lock lock(stateMutex_);
+            paused = paused_;
+            actuatorsEnabled = actuatorsEnabled_;
+            effectCount = effects_.size();
+        }
+        if (paused) state->dwState |= DIGFFS_PAUSED;
         const auto safetyMode = transport_.SafetyMode();
         const auto safeAndConnected =
             transport_.BrokerConnected() &&
             (safetyMode == dfgt::ipc::SafetyMode::Armed ||
              safetyMode == dfgt::ipc::SafetyMode::Active);
-        if (actuatorsEnabled_ && safeAndConnected) {
+        if (actuatorsEnabled && safeAndConnected) {
             state->dwState |=
                 DIGFFS_ACTUATORSON | DIGFFS_POWERON |
                 DIGFFS_SAFETYSWITCHOFF |
@@ -558,7 +581,7 @@ public:
         state->dwLoad = static_cast<DWORD>(
             std::min<std::size_t>(
                 100,
-                effects_.size() * 100 / kMaximumEffects));
+                effectCount * 100 / kMaximumEffects));
         return S_OK;
     }
 
@@ -584,7 +607,7 @@ public:
             static_cast<unsigned long>(*handle));
         const auto validateOnly = (flags & DIEP_NODOWNLOAD) != 0;
         const auto requested = flags & kEffectParameterFlags;
-        std::scoped_lock lock(stateMutex_);
+        std::unique_lock lock(stateMutex_);
         const auto creating = *handle == kInvalidEffectHandle;
         const auto existing = creating
             ? effects_.end()
@@ -627,17 +650,15 @@ public:
             stored.playing = true;
             ArmDeadline(stored, 1);
             timerWake_.notify_all();
-            return RenderEverythingLocked(std::chrono::steady_clock::now());
+            lock.unlock();
+            return RenderEverything(std::chrono::steady_clock::now());
         }
         if (stored.playing) {
-            if ((flags & DIEP_NORESTART) != 0) {
-                const auto now = std::chrono::steady_clock::now();
-                const auto software = RenderAllLocked(now);
-                return FAILED(software)
-                    ? software
-                    : RenderConditionsLocked(now);
-            }
-            return RenderEverythingLocked(std::chrono::steady_clock::now());
+            const auto noRestart = (flags & DIEP_NORESTART) != 0;
+            lock.unlock();
+            return noRestart
+                ? RenderCurrent(std::chrono::steady_clock::now())
+                : RenderEverything(std::chrono::steady_clock::now());
         }
         return S_OK;
     } catch (const std::bad_alloc&) {
@@ -653,13 +674,14 @@ public:
 
     HRESULT STDMETHODCALLTYPE DestroyEffect(DWORD externalId, DWORD handle) override {
         if (!Matches(externalId) || handle == kInvalidEffectHandle) return E_INVALIDARG;
-        std::scoped_lock lock(stateMutex_);
+        std::unique_lock lock(stateMutex_);
         const auto found = effects_.find(handle);
         if (found == effects_.end()) return DIERR_NOTDOWNLOADED;
         const bool wasPlaying = found->second.playing;
         effects_.erase(found);
+        lock.unlock();
         return wasPlaying
-            ? RenderEverythingLocked(std::chrono::steady_clock::now())
+            ? RenderEverything(std::chrono::steady_clock::now())
             : S_OK;
     }
 
@@ -676,7 +698,7 @@ public:
             static_cast<unsigned long>(iterations));
         if (!Matches(externalId)) return E_INVALIDARG;
         if ((mode & ~DIES_SOLO) != 0) return DIERR_INVALIDPARAM;
-        std::scoped_lock lock(stateMutex_);
+        std::unique_lock lock(stateMutex_);
         const auto found = effects_.find(handle);
         if (found == effects_.end()) return DIERR_NOTDOWNLOADED;
         if (iterations == 0) return DIERR_INVALIDPARAM;
@@ -694,7 +716,8 @@ public:
         found->second.playing = true;
         ArmDeadline(found->second, iterations);
         timerWake_.notify_all();
-        return RenderEverythingLocked(std::chrono::steady_clock::now());
+        lock.unlock();
+        return RenderEverything(std::chrono::steady_clock::now());
     }
 
     HRESULT STDMETHODCALLTYPE StopEffect(DWORD externalId, DWORD handle) override {
@@ -703,13 +726,14 @@ public:
             static_cast<unsigned long>(externalId),
             static_cast<unsigned long>(handle));
         if (!Matches(externalId)) return E_INVALIDARG;
-        std::scoped_lock lock(stateMutex_);
+        std::unique_lock lock(stateMutex_);
         const auto found = effects_.find(handle);
         if (found == effects_.end()) return DIERR_NOTDOWNLOADED;
         found->second.playing = false;
         found->second.hasDeadline = false;
         found->second.conditionStarted = false;
-        return RenderEverythingLocked(std::chrono::steady_clock::now());
+        lock.unlock();
+        return RenderEverything(std::chrono::steady_clock::now());
     }
 
     HRESULT STDMETHODCALLTYPE GetEffectStatus(
@@ -1055,7 +1079,11 @@ private:
             10000);
     }
 
-    HRESULT RenderAllLocked(std::chrono::steady_clock::time_point now) noexcept {
+    HRESULT RenderAll(std::chrono::steady_clock::time_point now) noexcept {
+        std::int32_t rendered = 0;
+        std::int32_t periodicRendered = 0;
+        {
+        std::scoped_lock lock(stateMutex_);
         if (paused_ || !actuatorsEnabled_) return S_OK;
         std::int64_t sum = 0;
         std::int64_t periodicSum = 0;
@@ -1080,11 +1108,12 @@ private:
             periodicSum * globalGain_ / 10000,
             -10000,
             10000);
-        const auto rendered = static_cast<std::int32_t>(scaled);
-        const auto periodicRendered =
+        rendered = static_cast<std::int32_t>(scaled);
+        periodicRendered =
             static_cast<std::int32_t>(periodicScaled);
         if (rendered == lastRendered_ &&
             periodicRendered == lastPeriodicRendered_) return S_OK;
+        }
         const auto result =
             transport_.Constant(rendered, periodicRendered);
         LogDiagnostic(
@@ -1093,16 +1122,31 @@ private:
             static_cast<long>(periodicRendered),
             static_cast<unsigned long>(result));
         if (SUCCEEDED(result)) {
+            std::scoped_lock lock(stateMutex_);
             lastRendered_ = rendered;
             lastPeriodicRendered_ = periodicRendered;
         }
         return result;
     }
 
-    HRESULT RenderConditionsLocked(
+    struct ConditionRender final {
+        DWORD handle{};
+        dfgt::ipc::Command command{};
+        LONG negativeCoefficient{};
+        LONG positiveCoefficient{};
+        LONG offset{};
+        DWORD deadBand{};
+        DWORD negativeSaturation{};
+        DWORD positiveSaturation{};
+    };
+
+    HRESULT RenderConditions(
         std::chrono::steady_clock::time_point now) noexcept {
+        std::vector<ConditionRender> renders;
+        {
+        std::scoped_lock lock(stateMutex_);
         if (paused_ || !actuatorsEnabled_) return S_OK;
-        for (auto& [_, effect] : effects_) {
+        for (const auto& [handle, effect] : effects_) {
             if (!effect.playing || now < effect.startsAt) continue;
             dfgt::ipc::Command command{};
             if (effect.kind == EffectKind::Spring) command = dfgt::ipc::Command::Spring;
@@ -1134,30 +1178,58 @@ private:
                     0,
                     10000));
             };
-            const auto result = transport_.Condition(
+            renders.push_back(ConditionRender{
+                handle,
                 command,
                 scaleSigned(effect.condition.lNegativeCoefficient),
                 scaleSigned(effect.condition.lPositiveCoefficient),
                 effect.condition.lOffset,
                 static_cast<DWORD>(effect.condition.lDeadBand),
                 scaleUnsigned(effect.condition.dwNegativeSaturation),
-                scaleUnsigned(effect.condition.dwPositiveSaturation));
+                scaleUnsigned(effect.condition.dwPositiveSaturation)});
+        }
+        }
+        for (const auto& render : renders) {
+            const auto result = transport_.Condition(
+                render.command,
+                render.negativeCoefficient,
+                render.positiveCoefficient,
+                render.offset,
+                render.deadBand,
+                render.negativeSaturation,
+                render.positiveSaturation);
             if (FAILED(result)) return result;
-            effect.conditionStarted = true;
+            std::scoped_lock lock(stateMutex_);
+            const auto effect = effects_.find(render.handle);
+            if (effect != effects_.end() && effect->second.playing)
+                effect->second.conditionStarted = true;
         }
         return S_OK;
     }
 
-    HRESULT RenderEverythingLocked(
+    HRESULT RenderCurrent(
         std::chrono::steady_clock::time_point now) noexcept {
-        const auto stopResult = transport_.StopAll();
-        lastRendered_ = 0;
-        lastPeriodicRendered_ = 0;
-        if (FAILED(stopResult)) return stopResult;
-        for (auto& [_, effect] : effects_) effect.conditionStarted = false;
-        const auto softwareResult = RenderAllLocked(now);
+        std::scoped_lock renderLock(renderMutex_);
+        const auto softwareResult = RenderAll(now);
         if (FAILED(softwareResult)) return softwareResult;
-        return RenderConditionsLocked(now);
+        return RenderConditions(now);
+    }
+
+    HRESULT RenderEverything(
+        std::chrono::steady_clock::time_point now) noexcept {
+        std::scoped_lock renderLock(renderMutex_);
+        const auto stopResult = transport_.StopAll();
+        {
+            std::scoped_lock lock(stateMutex_);
+            lastRendered_ = 0;
+            lastPeriodicRendered_ = 0;
+            for (auto& [_, effect] : effects_)
+                effect.conditionStarted = false;
+        }
+        if (FAILED(stopResult)) return stopResult;
+        const auto softwareResult = RenderAll(now);
+        if (FAILED(softwareResult)) return softwareResult;
+        return RenderConditions(now);
     }
 
     static void ArmDeadline(EffectState& effect, DWORD iterations) noexcept {
@@ -1177,10 +1249,10 @@ private:
             timerWake_.wait_for(waitLock, std::chrono::milliseconds(2));
             if (stop.stop_requested()) break;
 
+            bool rerenderConditions = false;
             {
                 std::scoped_lock lock(stateMutex_);
                 const auto now = std::chrono::steady_clock::now();
-                bool rerenderConditions = false;
                 for (auto& [_, effect] : effects_) {
                     if (!effect.playing) continue;
                     if (effect.hasDeadline && now >= effect.deadline) {
@@ -1201,16 +1273,19 @@ private:
                         rerenderConditions = true;
                     }
                 }
-                if (rerenderConditions) RenderEverythingLocked(now);
-                else RenderAllLocked(now);
-                transport_.UpdateRenderEpoch(++renderEpoch_);
             }
+            const auto now = std::chrono::steady_clock::now();
+            if (rerenderConditions) RenderEverything(now);
+            else RenderCurrent(now);
+            const auto epoch = ++renderEpoch_;
+            transport_.UpdateRenderEpoch(epoch);
         }
     }
 
     std::atomic<long> references_{1};
     BrokerTransport transport_;
     std::mutex stateMutex_;
+    std::mutex renderMutex_;
     std::unordered_map<DWORD, EffectState> effects_;
     std::atomic<DWORD> externalId_{};
     DWORD nextHandle_{kFirstEffectHandle};
