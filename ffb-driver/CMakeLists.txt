@@ -75,6 +75,21 @@ set_target_properties(DfgtTransportFakeTests PROPERTIES
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 add_test(NAME transport-fake-injections COMMAND DfgtTransportFakeTests)
 
+add_executable(DfgtSafetyStateTests tests/SafetyStateTests.cpp)
+target_compile_features(DfgtSafetyStateTests PRIVATE cxx_std_20)
+target_compile_definitions(DfgtSafetyStateTests PRIVATE
+    UNICODE
+    _UNICODE
+    WIN32_LEAN_AND_MEAN
+    NOMINMAX)
+target_compile_options(DfgtSafetyStateTests PRIVATE
+    /W4 /WX /permissive- /guard:cf)
+target_link_options(DfgtSafetyStateTests PRIVATE
+    /guard:cf /DYNAMICBASE /NXCOMPAT)
+set_target_properties(DfgtSafetyStateTests PROPERTIES
+    MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+add_test(NAME safety-state-machine COMMAND DfgtSafetyStateTests)
+
 add_executable(DfgtBrokerRangeSmoke tests/BrokerRangeSmoke.cpp)
 target_compile_features(DfgtBrokerRangeSmoke PRIVATE cxx_std_20)
 target_compile_definitions(DfgtBrokerRangeSmoke PRIVATE

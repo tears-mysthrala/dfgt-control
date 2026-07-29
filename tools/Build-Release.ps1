@@ -55,7 +55,8 @@ Invoke-Checked cmake @(
     'DfgtDirectInputFfb',
     'DfgtFfbComSmoke',
     'DfgtProtocolTests',
-    'DfgtTransportFakeTests')
+    'DfgtTransportFakeTests',
+    'DfgtSafetyStateTests')
 Invoke-Checked dotnet @(
     'publish', (Join-Path $driver 'ui\DfgtControl.csproj'),
     '-c', 'Release',
