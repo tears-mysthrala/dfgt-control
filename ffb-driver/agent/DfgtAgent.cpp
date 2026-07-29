@@ -683,10 +683,10 @@ private:
 } // namespace
 
 int WINAPI wWinMain(
-    HINSTANCE instance,
-    HINSTANCE,
-    PWSTR,
-    int) {
+    _In_ HINSTANCE instance,
+    _In_opt_ HINSTANCE,
+    _In_ PWSTR,
+    _In_ int) {
     const auto mutex = CreateMutexW(
         nullptr,
         TRUE,

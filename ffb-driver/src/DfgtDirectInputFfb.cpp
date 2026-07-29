@@ -1364,10 +1364,11 @@ private:
 
 } // namespace
 
+_Check_return_
 STDAPI DllGetClassObject(
-    REFCLSID clsid,
-    REFIID iid,
-    void** object) {
+    _In_ REFCLSID clsid,
+    _In_ REFIID iid,
+    _Outptr_ LPVOID FAR* object) {
     if (!IsEqualCLSID(clsid, CLSID_DfgtDirectInputFfb)) return CLASS_E_CLASSNOTAVAILABLE;
     auto* factory = new (std::nothrow) ClassFactory();
     if (factory == nullptr) return E_OUTOFMEMORY;
@@ -1376,6 +1377,7 @@ STDAPI DllGetClassObject(
     return result;
 }
 
+__control_entrypoint(DllExport)
 STDAPI DllCanUnloadNow() {
     return g_objects == 0 && g_locks == 0 ? S_OK : S_FALSE;
 }

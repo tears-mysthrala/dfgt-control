@@ -1027,7 +1027,7 @@ int RunClient(
         reinterpret_cast<PUCHAR>(&sessionNonce),
         sizeof(sessionNonce),
         BCRYPT_USE_SYSTEM_PREFERRED_RNG);
-    if (nonceResult < 0) sessionNonce = 0;
+    if (!BCRYPT_SUCCESS(nonceResult)) sessionNonce = 0;
     if (clientPid == 0 || !clientProcess.Valid() ||
         sessionNonce == 0) {
         std::scoped_lock lock(state.stateMutex);
@@ -1423,14 +1423,14 @@ void RunControlServer(
             GetCurrentProcessId(), &brokerSession);
         dfgt::broker::ClientProcessWatch clientProcess(clientPid);
         std::uint64_t sessionNonce = 0;
-        const auto nonceStatus = BCryptGenRandom(
+        const auto nonceReady = BCRYPT_SUCCESS(BCryptGenRandom(
             nullptr,
             reinterpret_cast<PUCHAR>(&sessionNonce),
             sizeof(sessionNonce),
-            BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG));
         if (clientPid == 0 || !clientProcess.Valid() ||
             clientSession != brokerSession ||
-            nonceStatus < 0 || sessionNonce == 0) {
+            !nonceReady || sessionNonce == 0) {
             DisconnectNamedPipe(pipe);
             CloseHandle(pipe);
             continue;

@@ -4,6 +4,7 @@
 
 #include <array>
 #include <string_view>
+#include <vector>
 
 namespace dfgt::ipc {
 
@@ -71,14 +72,14 @@ inline bool ValidatePipeServer(
         FALSE,
         serverPid);
     if (process == nullptr) return false;
-    std::array<wchar_t, 32768> serverPath{};
+    std::vector<wchar_t> serverPath(32768);
     DWORD serverLength =
         static_cast<DWORD>(serverPath.size());
     const auto serverOk = QueryFullProcessImageNameW(
         process, 0, serverPath.data(), &serverLength);
     CloseHandle(process);
     if (!serverOk) return false;
-    std::array<wchar_t, 32768> clientPath{};
+    std::vector<wchar_t> clientPath(32768);
     const auto clientLength = GetModuleFileNameW(
         clientModule,
         clientPath.data(),
