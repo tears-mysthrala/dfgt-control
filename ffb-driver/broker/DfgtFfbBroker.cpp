@@ -18,6 +18,7 @@
 
 #include "../shared/BrokerProtocol.h"
 #include "../shared/DfgtReports.h"
+#include "../shared/BoundedIo.h"
 #include "SafetyState.h"
 #include "EffectCoordinator.h"
 #include "LeaseWatchdog.h"
@@ -27,6 +28,7 @@ namespace {
 
 constexpr DWORD kReadTimeoutMs = 350;
 constexpr DWORD kHidWriteTimeoutMs = 75;
+constexpr DWORD kPipeIoTimeoutMs = 250;
 constexpr std::uint32_t kRangeLockEngageLow = 256;
 constexpr std::uint32_t kRangeLockReleaseLow = 1024;
 constexpr std::uint32_t kRangeLockEngageHigh = 16127;
@@ -540,9 +542,13 @@ bool ReadMessageWithTimeout(
         DWORD available = 0;
         if (!PeekNamedPipe(pipe, nullptr, 0, nullptr, &available, nullptr)) return false;
         if (available >= sizeof(message)) {
-            DWORD bytesRead = 0;
-            return ReadFile(pipe, &message, sizeof(message), &bytesRead, nullptr) &&
-                bytesRead == sizeof(message);
+            const auto read = dfgt::io::ReadExact(
+                pipe, &message, sizeof(message), kPipeIoTimeoutMs);
+            if (!read.Succeeded(sizeof(message))) {
+                SetLastError(HRESULT_CODE(read.result));
+                return false;
+            }
+            return true;
         }
         if (!forceActive && GetTickCount64() >= leaseDeadline) {
             SetLastError(ERROR_TIMEOUT);
@@ -728,9 +734,9 @@ bool WriteResponse(HANDLE pipe, std::uint32_t sequence, HRESULT result) {
     dfgt::ipc::Response response{};
     response.sequence = sequence;
     response.result = result;
-    DWORD written = 0;
-    return WriteFile(pipe, &response, sizeof(response), &written, nullptr) &&
-        written == sizeof(response);
+    const auto write = dfgt::io::WriteExact(
+        pipe, &response, sizeof(response), kPipeIoTimeoutMs);
+    return write.Succeeded(sizeof(response));
 }
 
 SECURITY_ATTRIBUTES MakePipeSecurity(PSECURITY_DESCRIPTOR& descriptor) {
@@ -1060,7 +1066,8 @@ void RunControlServer(
     while (!stop.stop_requested()) {
         const auto pipe = CreateNamedPipeW(
             dfgt::ipc::ControlPipeName,
-            PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
+            PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE |
+                FILE_FLAG_OVERLAPPED,
             PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT |
                 PIPE_REJECT_REMOTE_CLIENTS,
             1,
@@ -1075,9 +1082,9 @@ void RunControlServer(
             return;
         }
 
-        const auto connected = ConnectNamedPipe(pipe, nullptr);
-        const auto error = connected ? ERROR_SUCCESS : GetLastError();
-        if (!connected && error != ERROR_PIPE_CONNECTED) {
+        const auto connectResult =
+            dfgt::io::ConnectPipe(pipe, kPipeIoTimeoutMs);
+        if (FAILED(connectResult)) {
             CloseHandle(pipe);
             if (stop.stop_requested()) return;
             continue;
@@ -1089,14 +1096,14 @@ void RunControlServer(
 
         for (;;) {
             dfgt::ipc::control::Request request{};
-            DWORD bytesRead = 0;
-            if (!ReadFile(
-                    pipe,
-                    &request,
-                    sizeof(request),
-                    &bytesRead,
-                    nullptr) ||
-                bytesRead != sizeof(request)) {
+            const auto read = dfgt::io::ReadExact(
+                pipe, &request, sizeof(request), kPipeIoTimeoutMs);
+            if (!read.Succeeded(sizeof(request))) {
+                if (read.result ==
+                        HRESULT_FROM_WIN32(ERROR_TIMEOUT) &&
+                    !stop.stop_requested()) {
+                    continue;
+                }
                 break;
             }
             const auto result = ProcessControlRequest(request, state);
@@ -1104,14 +1111,9 @@ void RunControlServer(
             response.sequence = request.sequence;
             response.result = result;
             response.status = SnapshotStatus(state);
-            DWORD written = 0;
-            if (!WriteFile(
-                    pipe,
-                    &response,
-                    sizeof(response),
-                    &written,
-                    nullptr) ||
-                written != sizeof(response)) {
+            const auto write = dfgt::io::WriteExact(
+                pipe, &response, sizeof(response), kPipeIoTimeoutMs);
+            if (!write.Succeeded(sizeof(response))) {
                 break;
             }
             if (diagnostics) {
@@ -1169,7 +1171,8 @@ int wmain(int argc, wchar_t** argv) {
     for (;;) {
         const auto pipe = CreateNamedPipeW(
             dfgt::ipc::PipeName,
-            PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
+            PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE |
+                FILE_FLAG_OVERLAPPED,
             PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
             1,
             4096,
@@ -1182,9 +1185,8 @@ int wmain(int argc, wchar_t** argv) {
             return 11;
         }
 
-        const auto connected = ConnectNamedPipe(pipe, nullptr);
-        const auto error = connected ? ERROR_SUCCESS : GetLastError();
-        const bool ready = connected || error == ERROR_PIPE_CONNECTED;
+        const bool ready = SUCCEEDED(
+            dfgt::io::ConnectPipe(pipe, kPipeIoTimeoutMs));
 
         if (ready) {
             RunClient(

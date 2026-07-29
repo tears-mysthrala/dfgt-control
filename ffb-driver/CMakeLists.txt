@@ -126,6 +126,18 @@ set_target_properties(DfgtClientProcessWatchTests PROPERTIES
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 add_test(NAME client-process-watch COMMAND DfgtClientProcessWatchTests)
 
+add_executable(DfgtBoundedIoTests tests/BoundedIoTests.cpp)
+target_compile_features(DfgtBoundedIoTests PRIVATE cxx_std_20)
+target_compile_definitions(DfgtBoundedIoTests PRIVATE
+    UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_compile_options(DfgtBoundedIoTests PRIVATE
+    /W4 /WX /permissive- /guard:cf)
+target_link_options(DfgtBoundedIoTests PRIVATE
+    /guard:cf /DYNAMICBASE /NXCOMPAT)
+set_target_properties(DfgtBoundedIoTests PROPERTIES
+    MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+add_test(NAME bounded-pipe-io COMMAND DfgtBoundedIoTests)
+
 add_executable(DfgtBrokerRangeSmoke tests/BrokerRangeSmoke.cpp)
 target_compile_features(DfgtBrokerRangeSmoke PRIVATE cxx_std_20)
 target_compile_definitions(DfgtBrokerRangeSmoke PRIVATE

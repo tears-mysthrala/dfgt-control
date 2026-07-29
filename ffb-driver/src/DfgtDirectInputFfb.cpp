@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "../shared/BrokerProtocol.h"
+#include "../shared/BoundedIo.h"
 
 // {806A045D-E7E8-491E-A607-31495A7BF4A3}
 static constexpr GUID CLSID_DfgtDirectInputFfb{
@@ -44,6 +45,7 @@ constexpr DWORD kFirstEffectHandle = 1;
 constexpr std::size_t kMaximumEffects = 16;
 constexpr DWORD kFirmwareRevision = 0x1322;
 constexpr DWORD kDriverVersion = 0x00010000;
+constexpr DWORD kPipeIoTimeoutMs = 250;
 
 void LogDiagnostic(const char* format, ...) noexcept {
     wchar_t enabled[2]{};
@@ -117,7 +119,7 @@ public:
                 0,
                 nullptr,
                 OPEN_EXISTING,
-                0,
+                FILE_FLAG_OVERLAPPED,
                 nullptr);
             if (pipe_ == INVALID_HANDLE_VALUE) return HRESULT_FROM_WIN32(GetLastError());
             DWORD mode = PIPE_READMODE_MESSAGE;
@@ -246,18 +248,14 @@ private:
     HRESULT SendLocked(dfgt::ipc::Message& message) noexcept {
         if (pipe_ == INVALID_HANDLE_VALUE) return DIERR_NOTINITIALIZED;
         message.sequence = ++sequence_;
-        DWORD written = 0;
-        if (!WriteFile(pipe_, &message, sizeof(message), &written, nullptr) ||
-            written != sizeof(message)) {
-            return HRESULT_FROM_WIN32(GetLastError());
-        }
+        const auto write = dfgt::io::WriteExact(
+            pipe_, &message, sizeof(message), kPipeIoTimeoutMs);
+        if (!write.Succeeded(sizeof(message))) return write.result;
 
         dfgt::ipc::Response response{};
-        DWORD read = 0;
-        if (!ReadFile(pipe_, &response, sizeof(response), &read, nullptr) ||
-            read != sizeof(response)) {
-            return HRESULT_FROM_WIN32(GetLastError());
-        }
+        const auto read = dfgt::io::ReadExact(
+            pipe_, &response, sizeof(response), kPipeIoTimeoutMs);
+        if (!read.Succeeded(sizeof(response))) return read.result;
         if (response.magic != dfgt::ipc::Magic ||
             response.version != dfgt::ipc::Version ||
             response.size != sizeof(response) ||

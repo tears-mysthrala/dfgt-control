@@ -1,6 +1,11 @@
 #include "ControlClient.h"
+#include "../shared/BoundedIo.h"
 
 namespace dfgt::agent {
+
+namespace {
+constexpr DWORD kControlIoTimeoutMs = 500;
+}
 
 ControlClient::~ControlClient() {
     Close();
@@ -17,7 +22,7 @@ HRESULT ControlClient::Connect() noexcept {
         0,
         nullptr,
         OPEN_EXISTING,
-        0,
+        FILE_FLAG_OVERLAPPED,
         nullptr);
     if (pipe_ == INVALID_HANDLE_VALUE) {
         return HRESULT_FROM_WIN32(GetLastError());
@@ -113,27 +118,17 @@ HRESULT ControlClient::Exchange(
         return HRESULT_FROM_WIN32(ERROR_PIPE_NOT_CONNECTED);
     }
     request.sequence = ++sequence_;
-    DWORD written = 0;
-    if (!WriteFile(
-            pipe_,
-            &request,
-            sizeof(request),
-            &written,
-            nullptr) ||
-        written != sizeof(request)) {
-        const auto result = HRESULT_FROM_WIN32(GetLastError());
+    const auto write = dfgt::io::WriteExact(
+        pipe_, &request, sizeof(request), kControlIoTimeoutMs);
+    if (!write.Succeeded(sizeof(request))) {
+        const auto result = write.result;
         Close();
         return result;
     }
-    DWORD read = 0;
-    if (!ReadFile(
-            pipe_,
-            &response,
-            sizeof(response),
-            &read,
-            nullptr) ||
-        read != sizeof(response)) {
-        const auto result = HRESULT_FROM_WIN32(GetLastError());
+    const auto read = dfgt::io::ReadExact(
+        pipe_, &response, sizeof(response), kControlIoTimeoutMs);
+    if (!read.Succeeded(sizeof(response))) {
+        const auto result = read.result;
         Close();
         return result;
     }
