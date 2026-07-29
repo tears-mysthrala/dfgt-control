@@ -27,12 +27,30 @@ $fileChecks = @(
     if ($manifest) {
         foreach ($file in $manifest.files) {
             $exists = Test-Path -LiteralPath $file.path -PathType Leaf
+            $signature = if ($exists -and
+                [IO.Path]::GetExtension([string]$file.path) -in @(
+                    '.exe', '.dll', '.ps1')) {
+                Get-AuthenticodeSignature -LiteralPath $file.path
+            }
+            else { $null }
             [ordered]@{
                 path = $file.path
                 exists = $exists
                 hashMatch = $exists -and
                     (Get-FileHash -LiteralPath $file.path `
                         -Algorithm SHA256).Hash -eq [string]$file.sha256
+                authenticode = if ($signature) {
+                    [ordered]@{
+                        status = [string]$signature.Status
+                        signer = if ($signature.SignerCertificate) {
+                            [string]$signature.SignerCertificate.Subject
+                        }
+                        else { $null }
+                        acceptable = $signature.Status -in @(
+                            'Valid', 'NotSigned')
+                    }
+                }
+                else { $null }
             }
         }
     }
@@ -89,12 +107,23 @@ $deviceChecks = @(
     Get-CimInstance Win32_PnPSignedDriver |
         Where-Object { $_.DeviceID -like '*VID_046D&PID_C29A*' } |
         ForEach-Object {
+            $serviceProperty = Get-PnpDeviceProperty `
+                -InstanceId $_.DeviceID `
+                -KeyName 'DEVPKEY_Device_Service' `
+                -ErrorAction SilentlyContinue
+            $service = if ($serviceProperty -and
+                $serviceProperty.PSObject.Properties['Data']) {
+                [string]$serviceProperty.Data
+            }
+            else { $null }
             [ordered]@{
                 name = $_.DeviceName
                 infName = $_.InfName
                 provider = $_.DriverProviderName
-                microsoftInbox = $_.InfName -notmatch '^oem[0-9]+\.inf$' -and
+                service = $service
+                microsoftInbox = $_.InfName -ieq 'input.inf' -and
                     $_.DriverProviderName -match 'Microsoft'
+                hidUsbTransport = $service -ieq 'HidUsb'
             }
         }
 )
@@ -241,6 +270,7 @@ $requiredPassed = $hvciRegistry -eq 1 -and
     -not ($fileChecks | Where-Object { -not $_.hashMatch }) -and
     $deviceChecks.Count -gt 0 -and
     -not ($deviceChecks | Where-Object { -not $_.microsoftInbox }) -and
+    ($deviceChecks | Where-Object hidUsbTransport) -and
     -not ($serviceChecks | Where-Object running) -and
     -not ($providerChecks | Where-Object { -not $_.matches }) -and
     -not ($comChecks | Where-Object {
@@ -291,6 +321,17 @@ $failures = @(
     if ($hvciRegistry -ne 1) { 'HVCI is not configured enabled.' }
     if ($fileChecks | Where-Object { -not $_.hashMatch }) {
         'One or more installed files failed manifest verification.'
+    }
+    if ($fileChecks | Where-Object {
+        $_.authenticode -and -not $_.authenticode.acceptable }) {
+        'One or more installed files has an invalid Authenticode state.'
+    }
+    if ($deviceChecks.Count -eq 0 -or
+        @($deviceChecks |
+            Where-Object { -not $_.microsoftInbox }).Count -gt 0 -or
+        @($deviceChecks |
+            Where-Object hidUsbTransport).Count -eq 0) {
+        'The DFGT is not bound to Microsoft input.inf/HidUsb.'
     }
     if ($serviceChecks | Where-Object running) {
         'A legacy Logitech kernel service is still running.'
