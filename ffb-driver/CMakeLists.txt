@@ -278,3 +278,15 @@ set_target_properties(DfgtProfileValidationTests PROPERTIES
 add_test(
     NAME profile-document-validation
     COMMAND DfgtProfileValidationTests)
+
+add_executable(DfgtTimingJitterTests tests/TimingJitterTests.cpp)
+target_compile_features(DfgtTimingJitterTests PRIVATE cxx_std_20)
+target_compile_definitions(DfgtTimingJitterTests PRIVATE
+    UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_compile_options(DfgtTimingJitterTests PRIVATE
+    /W4 /WX /permissive- /guard:cf)
+target_link_options(DfgtTimingJitterTests PRIVATE
+    /guard:cf /DYNAMICBASE /NXCOMPAT)
+set_target_properties(DfgtTimingJitterTests PROPERTIES
+    MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+add_test(NAME timing-jitter COMMAND DfgtTimingJitterTests)

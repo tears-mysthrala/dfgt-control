@@ -78,3 +78,18 @@ frame and proves that a valid second client can connect.
 corrupted version/length rejection in both x86 and x64 builds.
 `broker-framing-integration` exercises the real broker without a HID path and
 cannot produce physical force.
+
+## Native UI bridge
+
+The native UI does not infer health from a process name. `DfgtAgent.exe`
+exposes `\\.\pipe\DfgtControl.Agent.v1` and accepts one bounded request per
+connection from the same user token. The UI validates the server PID and
+requires its image to be the sibling `DfgtAgent.exe`.
+
+The fixed request identifies `GetStatus`, `EmergencyStop` or
+`AcknowledgeAndRearm` and carries a monotonic UI sequence. The fixed response
+returns the broker HRESULT, device state, safety mode, connected flags, active
+slot mask, neutral-stop confirmation, last safety error, safety generation and
+active profile ID. Reads, writes and main-window dispatch each have a 500 ms
+deadline. Emergency and rearm are separate operations; a failed stop is
+displayed as unconfirmed and never as completed.

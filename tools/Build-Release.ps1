@@ -114,7 +114,11 @@ Copy-Item -LiteralPath @(
 ) -Destination $stage
 Copy-Item -LiteralPath @(
     (Join-Path $root 'docs\MIGRATION.md'),
-    (Join-Path $root 'docs\ARCHITECTURE.md')
+    (Join-Path $root 'docs\ARCHITECTURE.md'),
+    (Join-Path $root 'docs\IPC-PROTOCOL.md'),
+    (Join-Path $root 'docs\SAFETY-STATE-MACHINE.md'),
+    (Join-Path $root 'docs\TEST-MATRIX.md'),
+    (Join-Path $root 'docs\MIGRATION-ROLLBACK.md')
 ) -Destination (Join-Path $stage 'docs')
 
 $commitSha = (& git -C $root rev-parse HEAD).Trim()
