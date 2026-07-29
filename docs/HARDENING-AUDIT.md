@@ -57,6 +57,35 @@ Evidence labels used below:
 | CI-001 | P0 | Reproduced without hardware | CI previously compiled but barely tested. | CMake, CI | local CTest 14/14 per architecture | Register safe tests; physical manual | CI executes non-physical suites | Closed | No |
 | PERF-001 | P2 | Reproduced without hardware | `wait_for(2 ms)` had no jitter evidence. | provider | `timing-jitter` | High-resolution periodic timer | p50/p95/p99/max/missed published | Partially closed; end-to-end metrics pending | No |
 
+## P0 acceptance traceability
+
+The status below is deliberately stricter than “code exists”. `Pass` requires
+an executed test with the necessary scope; `Pending manual` remains a release
+gate.
+
+| # | Required invariant | Evidence | Status |
+|---:|---|---|---|
+| 1 | Sine cannot reactivate after emergency | `safety-state-machine` generation test | Pass |
+| 2 | Emergency remains latched until explicit rearm | `safety-state-machine` | Pass |
+| 3 | `Constant(0,0)` never emits `StopAll` | `effect-slot-isolation` | Pass |
+| 4 | Conditions survive software zero | `effect-slot-isolation` | Pass |
+| 5 | Auxiliary heartbeat cannot hide renderer death | `renderer-lease-watchdog` | Pass |
+| 6 | Client-process death stops ownership | `client-process-watch` | Pass |
+| 7 | Failed stop becomes `StopUnconfirmed` and blocks force | `safety-state-machine`, `emergency-io-gate` | Pass |
+| 8 | UI never reports an unconfirmed stop as confirmed | agent/UI protocol state plus native UI build; live UI check required | Pending manual |
+| 9 | Blocked HID write cannot indefinitely block control pipe | `bounded-pipe-io`, `emergency-io-gate` | Pass |
+| 10 | Effect-state mutex is not held across OS I/O | immutable snapshot design and contract suite; reviewed lock boundaries | Pass |
+| 11 | Same-slot conditions are deterministic | `effect-slot-isolation` | Pass |
+| 12 | `INFINITE` never becomes an artificial finite deadline | `effect-timing` | Pass |
+| 13 | `DIES_SOLO` and partial `DIEP` updates | `directinput-contract` | Pass |
+| 14 | Agent recovers absent-at-start and unplug/replug | `agent-recovery-policy`; real PnP transition pending | Pending manual |
+| 15 | Upgrade/uninstall never kill an attached broker first | `script-safety-invariants`; disconnected transactional run pending | Pending manual |
+| 16 | Elevation under different credentials targets intended user | explicit SID/hive invariant; secondary-credential VM run pending | Pending manual |
+| 17 | COM providers activate in x64 and x86 | packaged `DfgtFfbComSmoke.exe`, both architectures | Pass |
+| 18 | CI executes rather than merely builds tests | local release pipeline ran 16/16 on x64 and x86; remote workflow pending one grouped push | Pass locally |
+| 19 | Automated tests produce no physical force | broker integration requires `--diagnostics-no-force` and receives no HID path | Pass |
+| 20 | HVCI and Secure Boot are never disabled | script audit plus verifier; installed-release capture pending | Pass in code, pending live capture |
+
 ## Safety release rule
 
 No P0 row may be marked complete from code inspection alone. It requires a
