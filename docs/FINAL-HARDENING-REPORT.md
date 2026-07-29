@@ -21,10 +21,10 @@ arrival/removal, suspend/resume and schema-3 restore matrix in
 | DirectInput flags/timing were incomplete | Transactional DIEP updates, DIES_SOLO, saturated INFINITE deadlines | `directinput-contract`, `effect-timing` |
 | IPC used ABI structs without session binding | Explicit LE frames, nonce, sequence, capabilities, build ID and peer validation | `protocol-vectors`, framing integration |
 | UI inferred health from process names | Same-user agent pipe with PID/path validation and real broker safety state | native/UI builds |
-| Profile failures could overwrite valid data | Error taxonomy, corruption-only quarantine, revision/CAS, LKG backup and aligned validation | `profile-document-validation` |
+| Profile failures could overwrite valid data | Shared C++/C# golden corpus, cross-process lock, revision/CAS, crash recovery and LKG backup | `profile-document-validation`, `profile-golden-csharp` |
 | Elevated install targeted accidental HKCU | Mandatory target SID/profile and `HKEY_USERS\<SID>` | `script-safety-invariants` |
 | Upgrade/uninstall could stop an attached broker | Physical disconnect gate before path-owned `Stop-Process` | `script-safety-invariants` |
-| Upgrade had no rollback | Staging/previous-root swap, ownership checks and registry/file rollback | parser/invariant test; VM injection pending |
+| Upgrade had no rollback | Manifest-verified staging, journal/complete markers, interrupted recovery, maintenance handshake and registry/file rollback | parser/invariant test; VM injection pending |
 | Restore/uninstall accepted unsafe rollback inputs | Schema-3 identity/hash allowlist and verified-INF-only `pnputil` restore | `script-safety-invariants`; VM restore pending |
 | Release evidence was incomplete | Self-contained UI, `/sdl`, CodeQL workflow, SBOM, commit manifest, checksum and attestations | local package inspection |
 
@@ -45,10 +45,11 @@ arrival/removal, suspend/resume and schema-3 restore matrix in
 - `85849da` record beta hardening release decision
 - `4f0feb4` make packaged validation executable
 - `8a09f56` verify release provenance and live safety evidence
+- `b29da5b` make maintenance and profile writes transactional
 
 ## Automated results
 
-- Release CTest: 16/16 x64, 16/16 x86.
+- Release CTest: 17/17 x64, 17/17 x86.
 - WPF: Release self-contained build passed with zero warnings.
 - MSVC `/analyze`: passed after moving 131 KB peer-validation buffers from
   stack to heap and correcting API annotations/status checks.
@@ -56,7 +57,7 @@ arrival/removal, suspend/resume and schema-3 restore matrix in
 - Mitigations: ASLR, NX and Control Flow Guard present in x64/x86; x64 also
   reports high-entropy VA.
 - Package:
-  `DfgtControl-v0.1.0-beta-local3-win.zip`
+  `DfgtControl-v0.1.0-beta-local4-win.zip`
 - The generated `.sha256` and `release-manifest.json` are authoritative for
   the final package digest and embedded commit.
 

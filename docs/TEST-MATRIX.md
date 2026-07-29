@@ -21,12 +21,13 @@ Physical tests are excluded from CTest and GitHub Actions.
 | `effect-timing` | Pass | Pass | Saturating deadlines and INFINITE |
 | `broker-framing-integration` | Pass | Pass | Partial client cannot retain the pipe |
 | `profile-document-validation` | Pass | Pass | Unique IDs/paths/desktop and bounds |
+| `profile-golden-csharp` | Pass | Pass | C++ and C# consume the same validation corpus |
 | `timing-jitter` | Pass | Pass | High-resolution 2 ms timer remains bounded |
 | `agent-recovery-policy` | Pass | Pass | Reconnect/backoff and no automatic rearm |
 | `script-safety-invariants` | Pass | Pass | Disconnect-before-kill, SID and restore allowlist |
 
 Last local run: Windows 11 build 26100, MSVC 19.44, SDK 10.0.26100.0,
-CMake 3.29.2 and .NET SDK 9.0.316. Result: 16/16 x64 and 16/16 x86.
+CMake 3.29.2 and .NET SDK 9.0.316. Result: 17/17 x64 and 17/17 x86.
 
 The local 1,000-sample timing run produced:
 
