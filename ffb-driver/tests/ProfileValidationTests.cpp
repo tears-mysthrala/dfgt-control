@@ -4,7 +4,14 @@
 
 #include <iostream>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <string_view>
 #include <vector>
+
+#include <winrt/Windows.Data.Json.h>
+#include <winrt/Windows.Foundation.Collections.h>
+#include <winrt/base.h>
 
 namespace {
 
@@ -26,7 +33,7 @@ dfgt::agent::ProfileModel Game(
 
 } // namespace
 
-int wmain() {
+int wmain(int argc, wchar_t** argv) {
     using dfgt::agent::ProfileStore;
     bool ok = true;
 
@@ -82,8 +89,18 @@ int wmain() {
     {
         ProfileStore store(profilePath.wstring());
         ok &= Expect(store.Save(valid), "initial atomic save failed");
+        ProfileStore concurrent(profilePath.wstring());
+        std::vector<dfgt::agent::ProfileModel> concurrentProfiles;
+        ok &= Expect(
+            concurrent.Load(concurrentProfiles) ==
+                dfgt::agent::ProfileLoadResult::Loaded,
+            "concurrent store could not load baseline revision");
         valid[1].hardware.overallGain = 7500;
         ok &= Expect(store.Save(valid), "replacement atomic save failed");
+        concurrentProfiles[1].hardware.overallGain = 5000;
+        ok &= Expect(
+            !concurrent.Save(concurrentProfiles),
+            "stale profile revision overwrote a newer document");
         ok &= Expect(
             std::filesystem::exists(profilePath.wstring() + L".last-good"),
             "last-good backup was not retained");
@@ -106,6 +123,61 @@ int wmain() {
     std::error_code cleanupError;
     std::filesystem::remove_all(testRoot, cleanupError);
     ok &= Expect(!cleanupError, "profile test cleanup failed");
+
+    ok &= Expect(argc == 2, "golden corpus path is missing");
+    if (argc == 2) {
+        std::ifstream input(
+            std::filesystem::path(argv[1]),
+            std::ios::binary);
+        const std::string bytes{
+            std::istreambuf_iterator<char>(input),
+            std::istreambuf_iterator<char>()};
+        const auto root =
+            winrt::Windows::Data::Json::JsonObject::Parse(
+                winrt::to_hstring(std::string_view(bytes)));
+        for (const auto& value :
+             root.GetNamedArray(L"cases")) {
+            const auto test = value.GetObject();
+            const auto expected = test.GetNamedBoolean(L"valid");
+            const auto document = test.GetNamedObject(L"document");
+            const auto schema =
+                static_cast<int>(document.GetNamedNumber(L"schemaVersion"));
+            const auto revision =
+                static_cast<int>(document.GetNamedNumber(L"revision"));
+            std::vector<dfgt::agent::ProfileModel> models;
+            for (const auto& profileValue :
+                 document.GetNamedArray(L"profiles")) {
+                const auto object = profileValue.GetObject();
+                dfgt::agent::ProfileModel model{};
+                const auto id = object.GetNamedString(L"id");
+                wcsncpy_s(
+                    model.hardware.id, id.c_str(), _TRUNCATE);
+                model.name = object.GetNamedString(L"name").c_str();
+                model.executablePath =
+                    object.GetNamedString(L"executablePath").c_str();
+                model.hardware.rangeDegrees = static_cast<int>(
+                    object.GetNamedNumber(L"rangeDegrees"));
+                model.hardware.overallGain = static_cast<int>(
+                    object.GetNamedNumber(L"overallGain"));
+                model.hardware.boundaryForce = static_cast<int>(
+                    object.GetNamedNumber(L"boundaryForce"));
+                model.hardware.springGain = static_cast<int>(
+                    object.GetNamedNumber(L"springGain"));
+                model.hardware.damperGain = static_cast<int>(
+                    object.GetNamedNumber(L"damperGain"));
+                model.hardware.frictionGain = static_cast<int>(
+                    object.GetNamedNumber(L"frictionGain"));
+                model.hardware.periodicGain = static_cast<int>(
+                    object.GetNamedNumber(L"periodicGain"));
+                models.push_back(std::move(model));
+            }
+            const auto actual = schema == 1 && revision >= 0 &&
+                ProfileStore::ValidateDocument(models);
+            ok &= Expect(
+                actual == expected,
+                "C++ validator disagrees with shared golden corpus");
+        }
+    }
 
     return ok ? 0 : 1;
 }

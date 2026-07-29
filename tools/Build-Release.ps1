@@ -93,6 +93,8 @@ Copy-Item (Join-Path $release64 'DfgtFfbBroker.exe') `
     (Join-Path $stage 'bin\x64')
 Copy-Item (Join-Path $release64 'DfgtBrokerStatusSmoke.exe') `
     (Join-Path $stage 'bin\x64')
+Copy-Item (Join-Path $release64 'DfgtMaintenance.exe') `
+    (Join-Path $stage 'bin\x64')
 Copy-Item (Join-Path $release64 'DfgtAgent.exe') `
     (Join-Path $stage 'bin\x64')
 Copy-Item (Join-Path $uiPublish 'DfgtControl.exe') `

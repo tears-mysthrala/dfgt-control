@@ -152,6 +152,9 @@ $broker = Resolve-Artifact @(
 $statusSmoke = Resolve-Artifact @(
     'bin\x64\DfgtBrokerStatusSmoke.exe',
     'build-x64\Release\DfgtBrokerStatusSmoke.exe')
+$maintenance = Resolve-Artifact @(
+    'bin\x64\DfgtMaintenance.exe',
+    'build-x64\Release\DfgtMaintenance.exe')
 $agent = Resolve-Artifact @(
     'bin\x64\DfgtAgent.exe',
     'build-x64\Release\DfgtAgent.exe')
@@ -160,13 +163,14 @@ $ui = Resolve-Artifact @(
     'ui\publish\DfgtControl.exe')
 foreach ($artifact in @(
     $provider64, $provider32, $smoke64, $smoke32,
-    $broker, $statusSmoke, $agent, $ui)) {
+    $broker, $statusSmoke, $maintenance, $agent, $ui)) {
     if (-not (Test-Path -LiteralPath $artifact -PathType Leaf)) {
         throw "Required release artifact is missing: $artifact"
     }
 }
 foreach ($artifact in @(
-    $provider64, $smoke64, $broker, $statusSmoke, $agent, $ui)) {
+    $provider64, $smoke64, $broker, $statusSmoke,
+    $maintenance, $agent, $ui)) {
     Assert-PeArchitecture -Path $artifact -Architecture x64
 }
 foreach ($artifact in @($provider32, $smoke32)) {
@@ -230,7 +234,14 @@ $effects = @(
 $timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $backup = Join-Path $BackupRoot $timestamp
 $resolvedInstallRoot = [IO.Path]::GetFullPath($InstallRoot).TrimEnd('\')
-if ([IO.Path]::GetFileName($resolvedInstallRoot) -ne 'DfgtControl') {
+if (-not [IO.Path]::GetFileName($resolvedInstallRoot) -or
+    $resolvedInstallRoot -in @(
+        [IO.Path]::GetPathRoot($resolvedInstallRoot).TrimEnd('\'),
+        [IO.Path]::GetFullPath($env:ProgramFiles).TrimEnd('\'),
+        [IO.Path]::GetFullPath($env:ProgramData).TrimEnd('\'),
+        [IO.Path]::GetFullPath($env:WINDIR).TrimEnd('\'),
+        [IO.Path]::GetFullPath(
+            [Environment]::GetFolderPath('UserProfile')).TrimEnd('\'))) {
     throw "Refusing an unexpected install root: $resolvedInstallRoot"
 }
 $stagingRoot = "$resolvedInstallRoot.staging-$timestamp"
@@ -243,13 +254,48 @@ $installedSmoke64 = Join-Path $bin64 'DfgtFfbComSmoke.exe'
 $installedSmoke32 = Join-Path $bin32 'DfgtFfbComSmoke.exe'
 $installedBroker = Join-Path $bin64 'DfgtFfbBroker.exe'
 $installedStatusSmoke = Join-Path $bin64 'DfgtBrokerStatusSmoke.exe'
+$installedMaintenance = Join-Path $bin64 'DfgtMaintenance.exe'
 $installedAgent = Join-Path $bin64 'DfgtAgent.exe'
 $installedUi = Join-Path $bin64 'DfgtControl.exe'
+$installedTransactionMarker = Join-Path $InstallRoot `
+    '.dfgt-transaction.json'
+$installedCompleteMarker = Join-Path $InstallRoot '.dfgt-complete.json'
 
 if ($PSCmdlet.ShouldProcess($InstallRoot, 'Install DFGT user-mode FFB stack and registry')) {
     if (-not $principal.IsInRole(
             [Security.Principal.WindowsBuiltInRole]::Administrator)) {
         throw 'Run the installer from an elevated PowerShell process.'
+    }
+    $installParent = Split-Path -Parent $resolvedInstallRoot
+    $installLeaf = [IO.Path]::GetFileName($resolvedInstallRoot)
+    $orphanPrevious = @(
+        Get-ChildItem -LiteralPath $installParent -Directory `
+            -ErrorAction SilentlyContinue |
+            Where-Object Name -like "$installLeaf.previous-*"
+    )
+    $orphanStaging = @(
+        Get-ChildItem -LiteralPath $installParent -Directory `
+            -ErrorAction SilentlyContinue |
+            Where-Object Name -like "$installLeaf.staging-*"
+    )
+    if (-not (Test-Path -LiteralPath $resolvedInstallRoot) -and
+        $orphanPrevious.Count -eq 1 -and
+        (Test-Path -LiteralPath (
+            Join-Path $orphanPrevious[0].FullName 'install-manifest.json') `
+            -PathType Leaf)) {
+        Move-Item -LiteralPath $orphanPrevious[0].FullName `
+            -Destination $resolvedInstallRoot
+        foreach ($orphan in $orphanStaging) {
+            if (Test-Path -LiteralPath (
+                    Join-Path $orphan.FullName '.dfgt-transaction.json') `
+                    -PathType Leaf) {
+                Remove-Item -LiteralPath $orphan.FullName -Recurse -Force
+            }
+        }
+        throw 'Recovered the previous installation after an interrupted transaction. Review it, then run the installer again.'
+    }
+    if ($orphanPrevious -or $orphanStaging) {
+        throw 'An ambiguous interrupted installation exists; no files were changed. Review the staging/previous directories.'
     }
     $swapped = $false
     try {
@@ -261,6 +307,25 @@ if ($PSCmdlet.ShouldProcess($InstallRoot, 'Install DFGT user-mode FFB stack and 
     $stageBin32 = Join-Path $stagingRoot 'bin\x86'
     New-Item -ItemType Directory -Path $backup, $stageBin64, $stageBin32 `
         -Force | Out-Null
+    $transaction = [ordered]@{
+        schemaVersion = 1
+        state = 'staging'
+        installRoot = $resolvedInstallRoot
+        stagingRoot = $stagingRoot
+        previousRoot = $previousRoot
+        expectedVersion = $ExpectedVersion
+        sourceCommit = [string]$releaseManifest.commitSha
+        startedAt = (Get-Date).ToString('o')
+    }
+    $transactionJson = $transaction | ConvertTo-Json -Depth 4
+    [IO.File]::WriteAllText(
+        (Join-Path $stagingRoot '.dfgt-transaction.json'),
+        $transactionJson,
+        [Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText(
+        (Join-Path $backup 'install-journal.json'),
+        $transactionJson,
+        [Text.UTF8Encoding]::new($false))
 
     if (Test-Path -LiteralPath $oemRoot) {
         & reg.exe export 'HKLM\SYSTEM\CurrentControlSet\Control\MediaProperties\PrivateProperties\Joystick\OEM\VID_046D&PID_C29A' (Join-Path $backup 'oem-before.reg') /y | Out-Null
@@ -285,6 +350,8 @@ if ($PSCmdlet.ShouldProcess($InstallRoot, 'Install DFGT user-mode FFB stack and 
         -Destination (Join-Path $stageBin64 'DfgtFfbBroker.exe')
     Copy-Item -LiteralPath $statusSmoke `
         -Destination (Join-Path $stageBin64 'DfgtBrokerStatusSmoke.exe')
+    Copy-Item -LiteralPath $maintenance `
+        -Destination (Join-Path $stageBin64 'DfgtMaintenance.exe')
     Copy-Item -LiteralPath $agent `
         -Destination (Join-Path $stageBin64 'DfgtAgent.exe')
     Copy-Item -LiteralPath $ui `
@@ -296,6 +363,7 @@ if ($PSCmdlet.ShouldProcess($InstallRoot, 'Install DFGT user-mode FFB stack and 
         @{ Source = $smoke32; Destination = (Join-Path $stageBin32 'DfgtFfbComSmoke.exe') },
         @{ Source = $broker; Destination = (Join-Path $stageBin64 'DfgtFfbBroker.exe') },
         @{ Source = $statusSmoke; Destination = (Join-Path $stageBin64 'DfgtBrokerStatusSmoke.exe') },
+        @{ Source = $maintenance; Destination = (Join-Path $stageBin64 'DfgtMaintenance.exe') },
         @{ Source = $agent; Destination = (Join-Path $stageBin64 'DfgtAgent.exe') },
         @{ Source = $ui; Destination = (Join-Path $stageBin64 'DfgtControl.exe') }
     )) {
@@ -348,6 +416,25 @@ if ($PSCmdlet.ShouldProcess($InstallRoot, 'Install DFGT user-mode FFB stack and 
         )
         if ($presentDfgt) {
             throw 'Disconnect the DFGT before upgrade. No process has been stopped.'
+        }
+        $installedMaintenanceTool = Join-Path $resolvedInstallRoot `
+            'bin\x64\DfgtMaintenance.exe'
+        $installedAgentProcess = Get-CimInstance Win32_Process |
+            Where-Object {
+                $_.Name -eq 'DfgtAgent.exe' -and
+                $_.ExecutablePath -and
+                [IO.Path]::GetFullPath($_.ExecutablePath).StartsWith(
+                    "$resolvedInstallRoot\",
+                    [StringComparison]::OrdinalIgnoreCase)
+        }
+        if ($installedAgentProcess) {
+            if (Test-Path -LiteralPath $installedMaintenanceTool `
+                    -PathType Leaf) {
+                & $installedMaintenanceTool | Out-Null
+                if ($LASTEXITCODE -ne 0) {
+                    throw 'PrepareForMaintenance was not confirmed. Close games and retry with the wheel disconnected.'
+                }
+            }
         }
         Get-CimInstance Win32_Process |
             Where-Object {
@@ -435,6 +522,17 @@ if ($PSCmdlet.ShouldProcess($InstallRoot, 'Install DFGT user-mode FFB stack and 
     $shortcut.Description = 'Configurar Logitech Driving Force GT'
     $shortcut.Save()
 
+    $complete = [ordered]@{
+        schemaVersion = 1
+        state = 'complete'
+        version = $ExpectedVersion
+        sourceCommit = [string]$releaseManifest.commitSha
+        completedAt = (Get-Date).ToString('o')
+    }
+    [IO.File]::WriteAllText(
+        $installedCompleteMarker,
+        ($complete | ConvertTo-Json -Depth 3),
+        [Text.UTF8Encoding]::new($false))
     $manifest = [ordered]@{
         version = $ExpectedVersion
         sourceCommit = [string]$releaseManifest.commitSha
@@ -454,8 +552,11 @@ if ($PSCmdlet.ShouldProcess($InstallRoot, 'Install DFGT user-mode FFB stack and 
             $installedSmoke32,
             $installedBroker,
             $installedStatusSmoke,
+            $installedMaintenance,
             $installedAgent,
-            $installedUi
+            $installedUi,
+            $installedTransactionMarker,
+            $installedCompleteMarker
         ) | ForEach-Object {
             $hash = Get-FileHash -LiteralPath $_ -Algorithm SHA256
             [ordered]@{ path = $_; sha256 = $hash.Hash }

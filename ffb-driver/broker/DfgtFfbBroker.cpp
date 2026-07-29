@@ -1372,6 +1372,40 @@ HRESULT ProcessControlRequest(
         }
         break;
     }
+    case Command::PrepareForMaintenance: {
+        {
+            std::scoped_lock lock(state.stateMutex);
+            if (state.ffbClientConnected) {
+                result = HRESULT_FROM_WIN32(ERROR_BUSY);
+                break;
+            }
+        }
+        HRESULT stopResult = E_FAIL;
+        HRESULT rangeResult = E_FAIL;
+        {
+            std::scoped_lock lock(state.deviceMutex);
+            stopResult = state.device.StopAll();
+            rangeResult = SUCCEEDED(stopResult)
+                ? state.device.SetRange(900)
+                : stopResult;
+            if (SUCCEEDED(stopResult) &&
+                SUCCEEDED(rangeResult)) {
+                state.device.Close();
+            }
+        }
+        result = FAILED(stopResult) ? stopResult : rangeResult;
+        {
+            std::scoped_lock lock(state.stateMutex);
+            if (SUCCEEDED(result)) {
+                state.safety.ConfirmAllStopped();
+                state.safety.EnterMaintenanceSafe();
+            } else {
+                state.safety.MarkStopUnconfirmed(result);
+                state.stopRecoveryRequested = true;
+            }
+        }
+        break;
+    }
     default:
         result = E_INVALIDARG;
         break;

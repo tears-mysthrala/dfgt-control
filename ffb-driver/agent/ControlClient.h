@@ -23,6 +23,7 @@ public:
     HRESULT EmergencyStop() noexcept;
     HRESULT AcknowledgeAndRearm() noexcept;
     HRESULT DetachDevice() noexcept;
+    HRESULT PrepareForMaintenance() noexcept;
     HRESULT GetStatus(
         dfgt::ipc::control::Status& status) noexcept;
 

@@ -250,6 +250,17 @@ target_link_options(DfgtBrokerStatusSmoke PRIVATE
 set_target_properties(DfgtBrokerStatusSmoke PROPERTIES
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
+add_executable(DfgtMaintenance tests/MaintenanceSmoke.cpp)
+target_compile_features(DfgtMaintenance PRIVATE cxx_std_20)
+target_compile_definitions(DfgtMaintenance PRIVATE
+    UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_compile_options(DfgtMaintenance PRIVATE
+    /W4 /WX /permissive- /guard:cf)
+target_link_options(DfgtMaintenance PRIVATE
+    /guard:cf /DYNAMICBASE /NXCOMPAT)
+set_target_properties(DfgtMaintenance PROPERTIES
+    MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
 add_executable(DfgtAgent WIN32
     agent/DfgtAgent.cpp
     agent/ControlClient.cpp
@@ -288,7 +299,14 @@ set_target_properties(DfgtProfileValidationTests PROPERTIES
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 add_test(
     NAME profile-document-validation
-    COMMAND DfgtProfileValidationTests)
+    COMMAND DfgtProfileValidationTests
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/profile-golden.json)
+add_test(
+    NAME profile-golden-csharp
+    COMMAND dotnet run --configuration Release
+        --project ${CMAKE_CURRENT_SOURCE_DIR}/tests/ProfileGoldenTests.csproj
+        --
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/profile-golden.json)
 
 add_executable(DfgtTimingJitterTests tests/TimingJitterTests.cpp)
 target_compile_features(DfgtTimingJitterTests PRIVATE cxx_std_20)

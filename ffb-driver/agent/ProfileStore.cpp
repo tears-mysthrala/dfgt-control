@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <filesystem>
 #include <set>
@@ -209,6 +210,95 @@ void InsertNumber(
         JsonValue::CreateNumberValue(value));
 }
 
+class ProfileWriteLock final {
+public:
+    explicit ProfileWriteLock(const std::wstring& path)
+        : path_(path + L".lock"),
+          handle_(CreateFileW(
+              path_.c_str(), GENERIC_READ | GENERIC_WRITE, 0,
+              nullptr, CREATE_NEW,
+              FILE_ATTRIBUTE_HIDDEN | FILE_FLAG_WRITE_THROUGH,
+              nullptr)) {}
+    ~ProfileWriteLock() {
+        if (handle_ != INVALID_HANDLE_VALUE) {
+            CloseHandle(handle_);
+            DeleteFileW(path_.c_str());
+        }
+    }
+    [[nodiscard]] bool Acquired() const noexcept {
+        return handle_ != INVALID_HANDLE_VALUE;
+    }
+private:
+    std::wstring path_;
+    HANDLE handle_{INVALID_HANDLE_VALUE};
+};
+
+bool CurrentRevision(
+    const std::wstring& path,
+    std::int32_t& revision,
+    bool& missing) {
+    std::wstring text;
+    const auto read = ReadUtf8File(path, text);
+    missing = read == ProfileLoadResult::Missing;
+    if (missing) {
+        revision = 0;
+        return true;
+    }
+    if (read != ProfileLoadResult::Loaded) return false;
+    try {
+        const auto root = JsonObject::Parse(text);
+        revision = 0;
+        return !root.HasKey(L"revision") ||
+            (Integer(root, L"revision", revision) && revision >= 0);
+    } catch (...) {
+        return false;
+    }
+}
+
+void RecoverInterruptedWrite(const std::wstring& path) noexcept {
+    try {
+        namespace fs = std::filesystem;
+        const fs::path profile(path);
+        const auto lock = fs::path(path + L".lock");
+        std::error_code error;
+        if (fs::exists(lock, error)) {
+            const auto age = fs::file_time_type::clock::now() -
+                fs::last_write_time(lock, error);
+            if (!error && age > std::chrono::minutes(5))
+                fs::remove(lock, error);
+            else
+                return;
+        }
+        std::vector<fs::path> temporaries;
+        const auto prefix = profile.filename().wstring() + L".";
+        for (const auto& entry :
+             fs::directory_iterator(profile.parent_path(), error)) {
+            if (error || !entry.is_regular_file(error)) continue;
+            const auto name = entry.path().filename().wstring();
+            if (name.starts_with(prefix) && name.ends_with(L".tmp"))
+                temporaries.push_back(entry.path());
+        }
+        if (!fs::exists(profile, error)) {
+            const auto lastGood = fs::path(path + L".last-good");
+            if (fs::exists(lastGood, error)) {
+                fs::copy_file(lastGood, profile, error);
+            } else if (!temporaries.empty()) {
+                const auto newest = std::ranges::max_element(
+                    temporaries,
+                    [&](const auto& left, const auto& right) {
+                        return fs::last_write_time(left, error) <
+                            fs::last_write_time(right, error);
+                    });
+                if (newest != temporaries.end())
+                    fs::rename(*newest, profile, error);
+            }
+        }
+        for (const auto& temporary : temporaries)
+            fs::remove(temporary, error);
+    } catch (...) {
+    }
+}
+
 } // namespace
 
 ProfileStore::ProfileStore() {
@@ -216,11 +306,16 @@ ProfileStore::ProfileStore() {
     if (directory.empty()) return;
     std::error_code error;
     std::filesystem::create_directories(directory, error);
-    if (!error) path_ = directory + L"\\profiles.json";
+    if (!error) {
+        path_ = directory + L"\\profiles.json";
+        RecoverInterruptedWrite(path_);
+    }
 }
 
 ProfileStore::ProfileStore(std::wstring path)
-    : path_(std::move(path)) {}
+    : path_(std::move(path)) {
+    RecoverInterruptedWrite(path_);
+}
 
 ProfileLoadResult ProfileStore::Load(
     std::vector<ProfileModel>& profiles) {
@@ -308,6 +403,14 @@ bool ProfileStore::Save(
         profiles.empty() ||
         profiles.size() > 256 ||
         !ValidateDocument(profiles)) {
+        return false;
+    }
+    ProfileWriteLock writeLock(path_);
+    if (!writeLock.Acquired()) return false;
+    std::int32_t diskRevision = 0;
+    bool missing = false;
+    if (!CurrentRevision(path_, diskRevision, missing) ||
+        (!missing && diskRevision != revision_)) {
         return false;
     }
     try {

@@ -15,6 +15,7 @@ enum class Command : std::uint32_t {
     GetStatus = 1,
     EmergencyStop = 2,
     AcknowledgeAndRearm = 3,
+    PrepareForMaintenance = 4,
 };
 
 struct Request final {

@@ -114,6 +114,14 @@ HRESULT ControlClient::DetachDevice() noexcept {
     return Exchange(request, response);
 }
 
+HRESULT ControlClient::PrepareForMaintenance() noexcept {
+    dfgt::ipc::control::Request request{};
+    dfgt::ipc::control::Response response{};
+    request.command =
+        dfgt::ipc::control::Command::PrepareForMaintenance;
+    return Exchange(request, response);
+}
+
 HRESULT ControlClient::GetStatus(
     dfgt::ipc::control::Status& status) noexcept {
     dfgt::ipc::control::Request request{};

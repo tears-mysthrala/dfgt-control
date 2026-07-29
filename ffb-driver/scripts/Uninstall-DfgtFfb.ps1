@@ -26,7 +26,14 @@ $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
 $resolvedInstallRoot = [IO.Path]::GetFullPath($InstallRoot).TrimEnd('\')
 $manifestRoot = [IO.Path]::GetFullPath([string]$manifest.installRoot).TrimEnd('\')
 if ($resolvedInstallRoot -ne $manifestRoot -or
-    [IO.Path]::GetFileName($resolvedInstallRoot) -ne 'DfgtControl') {
+    -not [IO.Path]::GetFileName($resolvedInstallRoot) -or
+    $resolvedInstallRoot -in @(
+        [IO.Path]::GetPathRoot($resolvedInstallRoot).TrimEnd('\'),
+        [IO.Path]::GetFullPath($env:ProgramFiles).TrimEnd('\'),
+        [IO.Path]::GetFullPath($env:ProgramData).TrimEnd('\'),
+        [IO.Path]::GetFullPath($env:WINDIR).TrimEnd('\'),
+        [IO.Path]::GetFullPath(
+            [Environment]::GetFolderPath('UserProfile')).TrimEnd('\'))) {
     throw "Refusing cleanup of an unexpected install root: $resolvedInstallRoot"
 }
 if ([string]$manifest.targetUserSid -notmatch
@@ -88,6 +95,23 @@ if ($PSCmdlet.ShouldProcess($resolvedInstallRoot, 'Remove DFGT user-mode FFB sta
     )
     if ($presentDfgt) {
         throw 'Disconnect the DFGT before uninstall. No process or registration has been changed.'
+    }
+    $maintenanceTool = Join-Path $resolvedInstallRoot `
+        'bin\x64\DfgtMaintenance.exe'
+    $agentProcess = Get-CimInstance Win32_Process |
+        Where-Object {
+            $_.Name -eq 'DfgtAgent.exe' -and
+            $_.ExecutablePath -and
+            [IO.Path]::GetFullPath($_.ExecutablePath).StartsWith(
+                "$resolvedInstallRoot\",
+                [StringComparison]::OrdinalIgnoreCase)
+        }
+    if ($agentProcess -and
+        (Test-Path -LiteralPath $maintenanceTool -PathType Leaf)) {
+        & $maintenanceTool | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            throw 'PrepareForMaintenance was not confirmed. Close games and retry while disconnected.'
+        }
     }
     Get-CimInstance Win32_Process |
         Where-Object {

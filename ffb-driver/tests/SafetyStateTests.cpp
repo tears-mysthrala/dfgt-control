@@ -96,5 +96,22 @@ int main() {
         slots.Mode() == SafetyMode::Active,
         "remaining spring did not keep active state");
 
+    SafetyState maintenance;
+    maintenance.BeginInitialize();
+    maintenance.ConfirmNeutralReady();
+    maintenance.EnterMaintenanceSafe();
+    ok &= Expect(
+        maintenance.Mode() == SafetyMode::MaintenanceSafe &&
+            maintenance.StopConfirmed(),
+        "confirmed neutral state did not enter maintenance");
+    ok &= Expect(
+        FAILED(maintenance.CanAcceptForce()),
+        "maintenance-safe state accepted force");
+    maintenance.MarkStopUnconfirmed(E_FAIL);
+    maintenance.EnterMaintenanceSafe();
+    ok &= Expect(
+        maintenance.Mode() == SafetyMode::StopUnconfirmed,
+        "unconfirmed stop was hidden by maintenance state");
+
     return ok ? 0 : 1;
 }

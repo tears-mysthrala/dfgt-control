@@ -427,7 +427,7 @@ private:
                     request.command >=
                         dfgt::agentui::Command::GetStatus &&
                     request.command <=
-                        dfgt::agentui::Command::AcknowledgeAndRearm) {
+                        dfgt::agentui::Command::PrepareForMaintenance) {
                     UiBridgeCall call{};
                     call.command = request.command;
                     DWORD_PTR messageResult = 0;
@@ -501,6 +501,10 @@ private:
                 call->command ==
                 dfgt::agentui::Command::AcknowledgeAndRearm) {
                 call->result = control_.AcknowledgeAndRearm();
+            } else if (
+                call->command ==
+                dfgt::agentui::Command::PrepareForMaintenance) {
+                call->result = control_.PrepareForMaintenance();
             } else {
                 call->result = control_.GetStatus(call->status);
                 return 0;

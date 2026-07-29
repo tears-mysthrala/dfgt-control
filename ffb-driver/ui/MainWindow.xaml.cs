@@ -41,6 +41,7 @@ public partial class MainWindow : Window
 
     private void LoadProfiles()
     {
+        RecoverInterruptedProfileWrite();
         if (!File.Exists(profilePath))
         {
             document = new();
@@ -93,6 +94,40 @@ public partial class MainWindow : Window
             SaveStatus.Text = "Acceso denegado; fichero preservado";
         }
         BindProfiles();
+    }
+
+    private void RecoverInterruptedProfileWrite()
+    {
+        try
+        {
+            var directory = Path.GetDirectoryName(profilePath)!;
+            if (!Directory.Exists(directory)) return;
+            var lockPath = profilePath + ".lock";
+            if (File.Exists(lockPath) &&
+                File.GetLastWriteTimeUtc(lockPath) <
+                    DateTime.UtcNow.AddMinutes(-5))
+                File.Delete(lockPath);
+            var temporaries = Directory.GetFiles(
+                directory, "profiles.json.*.tmp");
+            if (!File.Exists(profilePath))
+            {
+                var lastGood = profilePath + ".last-good";
+                if (File.Exists(lastGood))
+                    File.Copy(lastGood, profilePath);
+                else
+                {
+                    var newest = temporaries
+                        .OrderByDescending(File.GetLastWriteTimeUtc)
+                        .FirstOrDefault();
+                    if (newest is not null)
+                        File.Move(newest, profilePath);
+                }
+            }
+            foreach (var temporary in temporaries)
+                if (File.Exists(temporary)) File.Delete(temporary);
+        }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
     }
 
     private static ProfileDocument NewDefaultDocument()
@@ -303,33 +338,45 @@ public partial class MainWindow : Window
         }
         try
         {
-            if (File.Exists(profilePath))
-            {
-                var current = JsonSerializer.Deserialize<ProfileDocument>(
-                    File.ReadAllText(profilePath), jsonOptions);
-                if (current?.Revision != loadedRevision)
-                    throw new InvalidOperationException(
-                        "el fichero cambió en otra instancia; vuelve a cargar");
-            }
-            document.Revision = checked(loadedRevision + 1);
             Directory.CreateDirectory(Path.GetDirectoryName(profilePath)!);
-            var temporary = profilePath + $".{Guid.NewGuid():N}.tmp";
-            var bytes = JsonSerializer.SerializeToUtf8Bytes(document, jsonOptions);
-            using (var stream = new FileStream(
-                temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None,
-                4096, FileOptions.WriteThrough))
+            var lockPath = profilePath + ".lock";
+            using var writeLock = new FileStream(
+                lockPath, FileMode.CreateNew, FileAccess.ReadWrite,
+                FileShare.None, 1, FileOptions.WriteThrough);
+            try
             {
-                stream.Write(bytes);
-                stream.Flush(true);
+                if (File.Exists(profilePath))
+                {
+                    var current = JsonSerializer.Deserialize<ProfileDocument>(
+                        File.ReadAllText(profilePath), jsonOptions);
+                    if (current?.Revision != loadedRevision)
+                        throw new InvalidOperationException(
+                            "el fichero cambió en otra instancia; vuelve a cargar");
+                }
+                document.Revision = checked(loadedRevision + 1);
+                var temporary = profilePath + $".{Guid.NewGuid():N}.tmp";
+                var bytes = JsonSerializer.SerializeToUtf8Bytes(document, jsonOptions);
+                using (var stream = new FileStream(
+                    temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None,
+                    4096, FileOptions.WriteThrough))
+                {
+                    stream.Write(bytes);
+                    stream.Flush(true);
+                }
+                if (File.Exists(profilePath))
+                    File.Replace(temporary, profilePath, profilePath + ".last-good", true);
+                else
+                    File.Move(temporary, profilePath);
+                loadedRevision = document.Revision;
+                dirty = false;
+                ProfilesList.Items.Refresh();
+                SaveStatus.Text = "Guardado · pendiente de confirmación del agente";
             }
-            if (File.Exists(profilePath))
-                File.Replace(temporary, profilePath, profilePath + ".last-good", true);
-            else
-                File.Move(temporary, profilePath);
-            loadedRevision = document.Revision;
-            dirty = false;
-            ProfilesList.Items.Refresh();
-            SaveStatus.Text = "Guardado · pendiente de confirmación del agente";
+            finally
+            {
+                writeLock.Dispose();
+                File.Delete(lockPath);
+            }
         }
         catch (Exception error) when (
             error is IOException or UnauthorizedAccessException or
@@ -456,7 +503,7 @@ public sealed class Profile
     };
 }
 
-internal static class ProfileValidator
+public static class ProfileValidator
 {
     public static bool IsValid(ProfileDocument? document, out string error)
     {

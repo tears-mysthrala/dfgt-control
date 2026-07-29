@@ -38,6 +38,12 @@ foreach ($entry in @(
     if ($disconnect -lt 0 -or $stop -lt 0 -or $disconnect -gt $stop) {
         throw "$($entry.Name) can stop a process before its disconnect gate."
     }
+    $maintenance = $entry.Text.IndexOf(
+        'DfgtMaintenance.exe',
+        [StringComparison]::Ordinal)
+    if ($maintenance -lt 0 -or $maintenance -gt $stop) {
+        throw "$($entry.Name) does not attempt maintenance before process stop."
+    }
 }
 if ($install -notmatch 'TargetUserSid' -or
     $install -notmatch 'Registry::HKEY_USERS') {
@@ -53,6 +59,12 @@ if ($install -notmatch 'staging-' -or
     $install -notmatch 'previous-' -or
     $install -notmatch 'catch\s*\{') {
     throw 'Installer transaction/rollback structure is absent.'
+}
+if ($install -notmatch '\.dfgt-transaction\.json' -or
+    $install -notmatch '\.dfgt-complete\.json' -or
+    $install -notmatch 'install-journal\.json' -or
+    $install -notmatch 'Recovered the previous installation') {
+    throw 'Installer lacks journal, complete marker or interrupted recovery.'
 }
 if ($restore -match '(?i)reg\.exe\s+import' -or
     $restore -notmatch '(?i)pnputil\.exe\s+/add-driver' -or

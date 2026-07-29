@@ -151,6 +151,17 @@ public:
         }
     }
 
+    void EnterMaintenanceSafe() noexcept {
+        if (mode_ == SafetyMode::EmergencyLatched ||
+            mode_ == SafetyMode::StopUnconfirmed ||
+            !stopConfirmed_) {
+            return;
+        }
+        mode_ = SafetyMode::MaintenanceSafe;
+        activeSlots_ = PhysicalSlot::None;
+        lastSafetyError_ = S_OK;
+    }
+
     void MarkStopUnconfirmed(HRESULT error) noexcept {
         mode_ = SafetyMode::StopUnconfirmed;
         stopConfirmed_ = false;

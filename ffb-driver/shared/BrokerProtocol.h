@@ -97,6 +97,7 @@ enum class Command : std::uint32_t {
     EmergencyStop = 5,
     DetachDevice = 6,
     AcknowledgeAndRearm = 7,
+    PrepareForMaintenance = 8,
 };
 
 enum class DeviceState : std::uint32_t {
