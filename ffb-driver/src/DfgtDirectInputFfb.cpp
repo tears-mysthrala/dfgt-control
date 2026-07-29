@@ -168,7 +168,12 @@ public:
         return result;
     }
 
-    HRESULT StopSlotOne() noexcept { return StopAll(); }
+    HRESULT StopSlotOne() noexcept {
+        active_ = false;
+        dfgt::ipc::Message message{};
+        message.command = dfgt::ipc::Command::StopSoftwareSlot;
+        return Send(message);
+    }
 
     HRESULT StopAll() noexcept {
         active_ = false;

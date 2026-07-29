@@ -22,6 +22,7 @@ enum class Command : std::uint32_t {
     Spring = 7,
     Damper = 8,
     Friction = 9,
+    StopSoftwareSlot = 10,
 };
 
 struct Message {
@@ -63,6 +64,7 @@ enum class Command : std::uint32_t {
     ApplyProfile = 4,
     EmergencyStop = 5,
     DetachDevice = 6,
+    AcknowledgeAndRearm = 7,
 };
 
 enum class DeviceState : std::uint32_t {
@@ -105,6 +107,11 @@ struct Status {
     std::int32_t overallGain{10000};
     std::int32_t boundaryForce{3000};
     std::int32_t lastResult{};
+    std::uint32_t safetyMode{};
+    std::uint32_t activeSlots{};
+    std::uint32_t stopConfirmed{};
+    std::int32_t lastSafetyError{};
+    std::uint64_t safetyGeneration{};
     wchar_t activeProfileId[ProfileIdCharacters]{};
 };
 
