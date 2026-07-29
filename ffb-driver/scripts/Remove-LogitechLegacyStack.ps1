@@ -5,6 +5,9 @@ param(
 
     [string]$InstallRoot = (Join-Path $env:ProgramFiles 'DfgtControl'),
 
+    [Parameter(Mandatory)]
+    [string]$ExpectedVersion,
+
     [switch]$Execute
 )
 
@@ -113,6 +116,7 @@ if ($PSCmdlet.ShouldProcess(
 
     & (Join-Path $PSScriptRoot 'Install-DfgtFfb.ps1') `
         -InstallRoot $resolvedInstall `
+        -ExpectedVersion $ExpectedVersion `
         -TargetUserSid ([string]$snapshot.accountSid) `
         -TargetUserProfile ([string]$snapshot.userProfile) `
         -Confirm:$false

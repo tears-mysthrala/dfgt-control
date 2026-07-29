@@ -15,6 +15,7 @@ system operation.
 $backup = .\scripts\Backup-LogitechLegacyStack.ps1 |
   ConvertFrom-Json
 .\scripts\Install-DfgtFfb.ps1 `
+  -ExpectedVersion '0.1.0-beta-local2' `
   -TargetUserSid $backup.accountSid `
   -TargetUserProfile $backup.userProfile `
   -Confirm:$false
@@ -34,6 +35,7 @@ DFGT is present and refuses to remove a package shared by another device.
 ```powershell
 .\scripts\Remove-LogitechLegacyStack.ps1 `
   -BackupDirectory $backup.backupDirectory `
+  -ExpectedVersion '0.1.0-beta-local2' `
   -Execute `
   -Confirm:$false
 ```
@@ -54,7 +56,12 @@ administrator decision.
 After reboot:
 
 ```powershell
-.\scripts\Verify-HvciStack.ps1
+.\scripts\Verify-HvciStack.ps1 `
+  -ExpectedVersion '0.1.0-beta-local2' `
+  -TargetUserSid $backup.accountSid `
+  -IncludeCodeIntegrityEvents `
+  -RunComSmoke `
+  -RunBrokerHandshake
 ```
 
 ## Rollback

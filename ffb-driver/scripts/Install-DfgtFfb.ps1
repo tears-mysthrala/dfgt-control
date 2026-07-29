@@ -4,6 +4,9 @@ param(
     [string]$BackupRoot = (Join-Path $env:ProgramData 'DfgtControl\backups'),
 
     [Parameter(Mandatory)]
+    [string]$ExpectedVersion,
+
+    [Parameter(Mandatory)]
     [string]$TargetUserSid,
 
     [Parameter(Mandatory)]
@@ -15,9 +18,6 @@ Set-StrictMode -Version Latest
 
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = [Security.Principal.WindowsPrincipal]::new($identity)
-if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    throw 'Run the installer from an elevated PowerShell process.'
-}
 if ($TargetUserSid -notmatch '^S-1-5-21-(?:[0-9]+-){3}[0-9]+$') {
     throw 'TargetUserSid is not an allowlisted interactive user SID.'
 }
@@ -31,6 +31,64 @@ if (-not (Test-Path -LiteralPath $resolvedUserProfile -PathType Container)) {
 }
 
 $driverRoot = Split-Path -Parent $PSScriptRoot
+$releaseManifestPath = Join-Path $driverRoot 'release-manifest.json'
+if (-not (Test-Path -LiteralPath $releaseManifestPath -PathType Leaf)) {
+    throw "Release manifest is missing: $releaseManifestPath"
+}
+$releaseManifest = Get-Content -LiteralPath $releaseManifestPath -Raw |
+    ConvertFrom-Json
+if ($releaseManifest.schemaVersion -ne 1 -or
+    [string]$releaseManifest.version -ne $ExpectedVersion -or
+    [string]$releaseManifest.commitSha -notmatch '^[0-9a-f]{40}$') {
+    throw 'Release manifest schema, version or commit is invalid.'
+}
+$manifestHashes = @{}
+foreach ($entry in $releaseManifest.files) {
+    $relative = [string]$entry.path
+    if ([IO.Path]::IsPathRooted($relative) -or
+        $relative.Contains('..') -or
+        [string]$entry.sha256 -notmatch '^[0-9A-Fa-f]{64}$') {
+        throw "Unsafe release-manifest entry: $relative"
+    }
+    $candidate = [IO.Path]::GetFullPath(
+        (Join-Path $driverRoot $relative))
+    if (-not $candidate.StartsWith(
+            ([IO.Path]::GetFullPath($driverRoot).TrimEnd('\') + '\'),
+            [StringComparison]::OrdinalIgnoreCase) -or
+        -not (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+        throw "Release artifact is missing or escapes its root: $relative"
+    }
+    $actualHash = (Get-FileHash -LiteralPath $candidate `
+        -Algorithm SHA256).Hash
+    if ($actualHash -ne [string]$entry.sha256) {
+        throw "Release artifact hash mismatch: $relative"
+    }
+    $manifestHashes[$candidate.ToLowerInvariant()] = $actualHash
+    if ([IO.Path]::GetExtension($candidate) -in @(
+            '.exe', '.dll', '.ps1')) {
+        $signature = Get-AuthenticodeSignature -LiteralPath $candidate
+        if ($signature.Status -notin @('Valid', 'NotSigned')) {
+            throw "Invalid Authenticode state for $relative`: $($signature.Status)"
+        }
+    }
+}
+$packageFiles = @(
+    Get-ChildItem -LiteralPath $driverRoot -File -Recurse |
+        Where-Object {
+            $_.FullName -notmatch '\\(?:build-|ui\\(?:bin|obj|publish))' -and
+            $_.FullName -ne $releaseManifestPath
+        }
+)
+$unexpectedFiles = @(
+    $packageFiles |
+        Where-Object {
+            -not $manifestHashes.ContainsKey($_.FullName.ToLowerInvariant())
+        }
+)
+if ($unexpectedFiles) {
+    throw "Release contains unmanifested files: $($unexpectedFiles.FullName -join ', ')"
+}
+
 function Resolve-Artifact {
     param([Parameter(Mandatory)][string[]]$Candidates)
     foreach ($candidate in $Candidates) {
@@ -40,6 +98,40 @@ function Resolve-Artifact {
         }
     }
     return Join-Path $driverRoot $Candidates[0]
+}
+
+function Assert-PeArchitecture {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][ValidateSet('x86', 'x64')][string]$Architecture
+    )
+    $stream = [IO.File]::OpenRead($Path)
+    try {
+        $reader = [IO.BinaryReader]::new($stream)
+        if ($reader.ReadUInt16() -ne 0x5A4D) {
+            throw "Artifact is not a PE image: $Path"
+        }
+        $stream.Position = 0x3C
+        $peOffset = $reader.ReadUInt32()
+        if ($peOffset -gt $stream.Length - 6) {
+            throw "Artifact has an invalid PE header: $Path"
+        }
+        $stream.Position = $peOffset
+        if ($reader.ReadUInt32() -ne 0x00004550) {
+            throw "Artifact has an invalid PE signature: $Path"
+        }
+        $machine = $reader.ReadUInt16()
+        $expectedMachine = if ($Architecture -eq 'x64') {
+            0x8664
+        }
+        else { 0x014c }
+        if ($machine -ne $expectedMachine) {
+            throw "Artifact architecture mismatch for $Path"
+        }
+    }
+    finally {
+        $stream.Dispose()
+    }
 }
 
 $provider64 = Resolve-Artifact @(
@@ -57,6 +149,9 @@ $smoke32 = Resolve-Artifact @(
 $broker = Resolve-Artifact @(
     'bin\x64\DfgtFfbBroker.exe',
     'build-x64\Release\DfgtFfbBroker.exe')
+$statusSmoke = Resolve-Artifact @(
+    'bin\x64\DfgtBrokerStatusSmoke.exe',
+    'build-x64\Release\DfgtBrokerStatusSmoke.exe')
 $agent = Resolve-Artifact @(
     'bin\x64\DfgtAgent.exe',
     'build-x64\Release\DfgtAgent.exe')
@@ -65,10 +160,17 @@ $ui = Resolve-Artifact @(
     'ui\publish\DfgtControl.exe')
 foreach ($artifact in @(
     $provider64, $provider32, $smoke64, $smoke32,
-    $broker, $agent, $ui)) {
+    $broker, $statusSmoke, $agent, $ui)) {
     if (-not (Test-Path -LiteralPath $artifact -PathType Leaf)) {
         throw "Required release artifact is missing: $artifact"
     }
+}
+foreach ($artifact in @(
+    $provider64, $smoke64, $broker, $statusSmoke, $agent, $ui)) {
+    Assert-PeArchitecture -Path $artifact -Architecture x64
+}
+foreach ($artifact in @($provider32, $smoke32)) {
+    Assert-PeArchitecture -Path $artifact -Architecture x86
 }
 
 $clsid = '{806A045D-E7E8-491E-A607-31495A7BF4A3}'
@@ -140,10 +242,15 @@ $installedProvider32 = Join-Path $bin32 'DfgtDirectInputFfb.dll'
 $installedSmoke64 = Join-Path $bin64 'DfgtFfbComSmoke.exe'
 $installedSmoke32 = Join-Path $bin32 'DfgtFfbComSmoke.exe'
 $installedBroker = Join-Path $bin64 'DfgtFfbBroker.exe'
+$installedStatusSmoke = Join-Path $bin64 'DfgtBrokerStatusSmoke.exe'
 $installedAgent = Join-Path $bin64 'DfgtAgent.exe'
 $installedUi = Join-Path $bin64 'DfgtControl.exe'
 
 if ($PSCmdlet.ShouldProcess($InstallRoot, 'Install DFGT user-mode FFB stack and registry')) {
+    if (-not $principal.IsInRole(
+            [Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        throw 'Run the installer from an elevated PowerShell process.'
+    }
     $swapped = $false
     try {
     if ((Test-Path -LiteralPath $stagingRoot) -or
@@ -176,10 +283,30 @@ if ($PSCmdlet.ShouldProcess($InstallRoot, 'Install DFGT user-mode FFB stack and 
         -Destination (Join-Path $stageBin32 'DfgtFfbComSmoke.exe')
     Copy-Item -LiteralPath $broker `
         -Destination (Join-Path $stageBin64 'DfgtFfbBroker.exe')
+    Copy-Item -LiteralPath $statusSmoke `
+        -Destination (Join-Path $stageBin64 'DfgtBrokerStatusSmoke.exe')
     Copy-Item -LiteralPath $agent `
         -Destination (Join-Path $stageBin64 'DfgtAgent.exe')
     Copy-Item -LiteralPath $ui `
         -Destination (Join-Path $stageBin64 'DfgtControl.exe')
+    foreach ($pair in @(
+        @{ Source = $provider64; Destination = (Join-Path $stageBin64 'DfgtDirectInputFfb.dll') },
+        @{ Source = $provider32; Destination = (Join-Path $stageBin32 'DfgtDirectInputFfb.dll') },
+        @{ Source = $smoke64; Destination = (Join-Path $stageBin64 'DfgtFfbComSmoke.exe') },
+        @{ Source = $smoke32; Destination = (Join-Path $stageBin32 'DfgtFfbComSmoke.exe') },
+        @{ Source = $broker; Destination = (Join-Path $stageBin64 'DfgtFfbBroker.exe') },
+        @{ Source = $statusSmoke; Destination = (Join-Path $stageBin64 'DfgtBrokerStatusSmoke.exe') },
+        @{ Source = $agent; Destination = (Join-Path $stageBin64 'DfgtAgent.exe') },
+        @{ Source = $ui; Destination = (Join-Path $stageBin64 'DfgtControl.exe') }
+    )) {
+        $expectedHash = $manifestHashes[
+            ([IO.Path]::GetFullPath($pair.Source)).ToLowerInvariant()]
+        $stagedHash = (Get-FileHash -LiteralPath $pair.Destination `
+            -Algorithm SHA256).Hash
+        if (-not $expectedHash -or $stagedHash -ne $expectedHash) {
+            throw "Staged artifact hash mismatch: $($pair.Destination)"
+        }
+    }
 
     $isUpgrade = Test-Path -LiteralPath $resolvedInstallRoot -PathType Container
     if ($isUpgrade) {
@@ -309,6 +436,8 @@ if ($PSCmdlet.ShouldProcess($InstallRoot, 'Install DFGT user-mode FFB stack and 
     $shortcut.Save()
 
     $manifest = [ordered]@{
+        version = $ExpectedVersion
+        sourceCommit = [string]$releaseManifest.commitSha
         installedAt = (Get-Date).ToString('o')
         installedBy = $identity.Name
         targetUserSid = $TargetUserSid
@@ -324,6 +453,7 @@ if ($PSCmdlet.ShouldProcess($InstallRoot, 'Install DFGT user-mode FFB stack and 
             $installedSmoke64,
             $installedSmoke32,
             $installedBroker,
+            $installedStatusSmoke,
             $installedAgent,
             $installedUi
         ) | ForEach-Object {

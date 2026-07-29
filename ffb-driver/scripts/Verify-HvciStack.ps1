@@ -1,13 +1,21 @@
 [CmdletBinding()]
-param()
+param(
+    [string]$InstallRoot = (Join-Path $env:ProgramFiles 'DfgtControl'),
+    [string]$ExpectedVersion,
+    [string]$TargetUserSid = (
+        [Security.Principal.WindowsIdentity]::GetCurrent().User.Value),
+    [switch]$IncludeCodeIntegrityEvents,
+    [switch]$RunComSmoke,
+    [switch]$RunBrokerHandshake
+)
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 $expectedClsid = '{806A045D-E7E8-491E-A607-31495A7BF4A3}'
 $legacyServices = @('WmHidLo', 'WmFilter', 'WmVirHid', 'WmBEnum', 'WmXlCore')
-$manifestPath = Join-Path $env:ProgramFiles `
-    'DfgtControl\install-manifest.json'
+$resolvedInstallRoot = [IO.Path]::GetFullPath($InstallRoot).TrimEnd('\')
+$manifestPath = Join-Path $resolvedInstallRoot 'install-manifest.json'
 $manifest = if (Test-Path -LiteralPath $manifestPath -PathType Leaf) {
     Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
 }
@@ -64,7 +72,7 @@ $serviceChecks = @(
 )
 $ffRoots = @(
     'HKLM:\SYSTEM\CurrentControlSet\Control\MediaProperties\PrivateProperties\Joystick\OEM\VID_046D&PID_C29A\OEMForceFeedback',
-    'HKCU:\SYSTEM\CurrentControlSet\Control\MediaProperties\PrivateProperties\Joystick\OEM\VID_046D&PID_C29A\OEMForceFeedback'
+    "Registry::HKEY_USERS\$TargetUserSid\SYSTEM\CurrentControlSet\Control\MediaProperties\PrivateProperties\Joystick\OEM\VID_046D&PID_C29A\OEMForceFeedback"
 )
 $providerChecks = @(
     foreach ($ffRoot in $ffRoots) {
@@ -107,12 +115,17 @@ $comChecks = @(
         else { $null }
         $exists = $registeredPath -and
             (Test-Path -LiteralPath $registeredPath -PathType Leaf)
+        $threadingModel = if (Test-Path -LiteralPath $item.path) {
+            (Get-ItemProperty -LiteralPath $item.path `
+                -ErrorAction SilentlyContinue).ThreadingModel
+        }
+        else { $null }
         $smokePath = if ($registeredPath) {
             Join-Path (Split-Path -Parent $registeredPath) `
                 'DfgtFfbComSmoke.exe'
         }
         else { $null }
-        $activation = if ($exists -and
+        $activation = if ($RunComSmoke -and $exists -and
             (Test-Path -LiteralPath $smokePath -PathType Leaf)) {
             & $smokePath $registeredPath 2>&1 | Out-String
             [ordered]@{
@@ -132,6 +145,7 @@ $comChecks = @(
             architecture = $item.architecture
             registryPath = $item.path
             serverPath = $registeredPath
+            threadingModel = $threadingModel
             exists = [bool]$exists
             ownedByManifest = [bool]($exists -and $manifest -and
                 @($manifest.files.path) -contains $registeredPath)
@@ -143,12 +157,22 @@ $filterChecks = @(
     Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue |
         Where-Object InstanceId -like '*VID_046D&PID_C29A*' |
         ForEach-Object {
-            $upper = @(Get-PnpDeviceProperty -InstanceId $_.InstanceId `
+            $upperProperty = Get-PnpDeviceProperty -InstanceId $_.InstanceId `
                 -KeyName 'DEVPKEY_Device_UpperFilters' `
-                -ErrorAction SilentlyContinue).Data
-            $lower = @(Get-PnpDeviceProperty -InstanceId $_.InstanceId `
+                -ErrorAction SilentlyContinue
+            $lowerProperty = Get-PnpDeviceProperty -InstanceId $_.InstanceId `
                 -KeyName 'DEVPKEY_Device_LowerFilters' `
-                -ErrorAction SilentlyContinue).Data
+                -ErrorAction SilentlyContinue
+            $upper = if ($upperProperty -and
+                $upperProperty.PSObject.Properties['Data']) {
+                @($upperProperty.Data)
+            }
+            else { @() }
+            $lower = if ($lowerProperty -and
+                $lowerProperty.PSObject.Properties['Data']) {
+                @($lowerProperty.Data)
+            }
+            else { @() }
             [ordered]@{
                 instanceId = $_.InstanceId
                 upperFilters = $upper
@@ -159,7 +183,10 @@ $filterChecks = @(
             }
         }
 )
-$codeIntegrityEvents = try {
+$codeIntegrityEvents = @(if (-not $IncludeCodeIntegrityEvents) {
+    @()
+}
+else { try {
     @(
         Get-WinEvent -FilterHashtable @{
             LogName = 'Microsoft-Windows-CodeIntegrity/Operational'
@@ -173,6 +200,38 @@ $codeIntegrityEvents = try {
 }
 catch {
     @()
+} })
+
+$brokerHandshake = if ($RunBrokerHandshake) {
+    $statusSmoke = Join-Path $resolvedInstallRoot `
+        'bin\x64\DfgtBrokerStatusSmoke.exe'
+    if (Test-Path -LiteralPath $statusSmoke -PathType Leaf) {
+        $output = & $statusSmoke 2>&1 | Out-String
+        $exitCode = $LASTEXITCODE
+        $parsed = try { $output | ConvertFrom-Json } catch { $null }
+        [ordered]@{
+            tested = $true
+            passed = $exitCode -eq 0 -and $null -ne $parsed
+            exitCode = $exitCode
+            status = $parsed
+        }
+    }
+    else {
+        [ordered]@{
+            tested = $false
+            passed = $false
+            exitCode = $null
+            status = $null
+        }
+    }
+}
+else {
+    [ordered]@{
+        tested = $false
+        passed = $false
+        exitCode = $null
+        status = $null
+    }
 }
 
 $hvciRunning = $deviceGuard.SecurityServicesRunning -contains 2
@@ -186,9 +245,69 @@ $requiredPassed = $hvciRegistry -eq 1 -and
     -not ($providerChecks | Where-Object { -not $_.matches }) -and
     -not ($comChecks | Where-Object {
         -not $_.exists -or -not $_.ownedByManifest -or
-        -not $_.activation.tested -or -not $_.activation.passed }) -and
+        $_.threadingModel -ne 'Both' }) -and
     -not ($filterChecks | Where-Object legacyFilterPresent)
-$notTested = @('Broker safety state and neutral confirmation')
+$notTested = @(
+    if (-not $RunComSmoke) {
+        'DirectInput COM activation x64/x86'
+    }
+    elseif ($comChecks | Where-Object {
+        -not $_.activation.tested -or -not $_.activation.passed }) {
+        'DirectInput COM activation x64/x86 did not pass'
+    }
+    if (-not $RunBrokerHandshake) {
+        'Broker handshake and safety state'
+    }
+    elseif (-not $brokerHandshake.tested -or
+        -not $brokerHandshake.passed) {
+        'Broker handshake and safety state did not pass'
+    }
+    if (-not $IncludeCodeIntegrityEvents) {
+        'Recent Code Integrity events'
+    }
+)
+$warnings = @(
+    if (-not $secureBoot.querySucceeded) {
+        "Secure Boot could not be queried: $($secureBoot.error)"
+    }
+    if ($codeIntegrityEvents.Count -gt 0) {
+        'Relevant recent Code Integrity events were found; inspect evidence.'
+    }
+)
+$failures = @(
+    if (-not $manifest) { 'Install manifest is missing.' }
+    elseif ($ExpectedVersion -and
+        (-not $manifest.PSObject.Properties['version'] -or
+         [string]$manifest.version -ne $ExpectedVersion)) {
+        "Installed version does not match $ExpectedVersion."
+    }
+    if ($manifest -and (
+        -not $manifest.PSObject.Properties['installRoot'] -or
+        [IO.Path]::GetFullPath([string]$manifest.installRoot).TrimEnd('\') -ne
+            $resolvedInstallRoot)) {
+        'Install manifest targets another root.'
+    }
+    if (-not $hvciRunning) { 'HVCI is not reported running.' }
+    if ($hvciRegistry -ne 1) { 'HVCI is not configured enabled.' }
+    if ($fileChecks | Where-Object { -not $_.hashMatch }) {
+        'One or more installed files failed manifest verification.'
+    }
+    if ($serviceChecks | Where-Object running) {
+        'A legacy Logitech kernel service is still running.'
+    }
+    if ($filterChecks | Where-Object legacyFilterPresent) {
+        'A legacy Logitech device filter remains attached.'
+    }
+    if ($providerChecks | Where-Object { -not $_.matches }) {
+        'A force-feedback provider registration does not match.'
+    }
+    if ($comChecks | Where-Object {
+        -not $_.exists -or -not $_.ownedByManifest -or
+        $_.threadingModel -ne 'Both' }) {
+        'COM registration, ownership or ThreadingModel is invalid.'
+    }
+)
+$requiredPassed = $requiredPassed -and $failures.Count -eq 0
 $verdict = if (-not $requiredPassed) { 'fail' }
     elseif ($notTested.Count -gt 0) { 'incomplete' }
     else { 'pass' }
@@ -197,7 +316,22 @@ $verdict = if (-not $requiredPassed) { 'fail' }
     capturedAt = (Get-Date).ToString('o')
     verdict = $verdict
     passed = $verdict -eq 'pass'
+    warnings = $warnings
+    failures = $failures
     notTested = $notTested
+    evidence = [ordered]@{
+        installRoot = $resolvedInstallRoot
+        expectedVersion = $ExpectedVersion
+        targetUserSid = $TargetUserSid
+    }
+    remediation = @(
+        if ($failures.Count -gt 0) {
+            'Disconnect the wheel and correct the listed failures before re-running verification.'
+        }
+        if ($notTested.Count -gt 0) {
+            'Re-run with the explicit IncludeCodeIntegrityEvents, RunComSmoke and RunBrokerHandshake switches as appropriate.'
+        }
+    )
     secureBoot = $secureBoot
     hvci = [ordered]@{
         registryEnabled = $hvciRegistry
@@ -216,9 +350,13 @@ $verdict = if (-not $requiredPassed) { 'fail' }
     com = $comChecks
     filters = $filterChecks
     codeIntegrityEvents = $codeIntegrityEvents
+    brokerHandshake = $brokerHandshake
     safety = [ordered]@{
-        status = 'notTested'
-        reason = 'Verifier performs no force and no control-pipe session is bundled yet.'
+        status = if ($brokerHandshake.passed) {
+            $brokerHandshake.status
+        }
+        else { 'notTested' }
+        reason = 'Status smoke sends only Ping and GetStatus; it never sends force or attach commands.'
     }
     manifest = $manifestPath
     files = $fileChecks

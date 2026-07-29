@@ -43,6 +43,12 @@ if ($install -notmatch 'TargetUserSid' -or
     $install -notmatch 'Registry::HKEY_USERS') {
     throw 'Installer does not bind user changes to an explicit SID hive.'
 }
+if ($install -notmatch 'release-manifest\.json' -or
+    $install -notmatch 'ExpectedVersion' -or
+    $install -notmatch 'Assert-PeArchitecture' -or
+    $install -notmatch 'Staged artifact hash mismatch') {
+    throw 'Installer does not verify release provenance before and after staging.'
+}
 if ($install -notmatch 'staging-' -or
     $install -notmatch 'previous-' -or
     $install -notmatch 'catch\s*\{') {
@@ -66,6 +72,30 @@ if ($verify -notmatch 'DfgtFfbComSmoke\.exe' -or
     $verify -notmatch 'activation\.tested' -or
     $verify -notmatch 'activation\.passed') {
     throw 'Verifier does not execute the packaged no-force COM smoke tests.'
+}
+foreach ($parameter in @(
+    'InstallRoot',
+    'ExpectedVersion',
+    'TargetUserSid',
+    'IncludeCodeIntegrityEvents',
+    'RunComSmoke',
+    'RunBrokerHandshake')) {
+    if ($verify -notmatch [regex]::Escape($parameter)) {
+        throw "Verifier parameter is missing: $parameter"
+    }
+}
+foreach ($field in @(
+    'warnings', 'failures', 'notTested', 'evidence', 'remediation')) {
+    if ($verify -notmatch [regex]::Escape($field)) {
+        throw "Verifier evidence field is missing: $field"
+    }
+}
+$statusSmokePath = Join-Path (Split-Path -Parent $ScriptsDirectory) `
+    'tests\BrokerStatusSmoke.cpp'
+$statusSmoke = Get-Content -LiteralPath $statusSmokePath -Raw
+if ($statusSmoke -match 'AttachDevice|ApplyProfile|EmergencyStop|SetRange' -or
+    $statusSmoke -notmatch 'Command::GetStatus') {
+    throw 'Broker status smoke is not strictly read-only.'
 }
 
 Write-Output 'script safety invariants passed'

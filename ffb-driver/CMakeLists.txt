@@ -239,6 +239,17 @@ target_link_options(DfgtControlSmoke PRIVATE /guard:cf /DYNAMICBASE /NXCOMPAT)
 set_target_properties(DfgtControlSmoke PROPERTIES
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
+add_executable(DfgtBrokerStatusSmoke tests/BrokerStatusSmoke.cpp)
+target_compile_features(DfgtBrokerStatusSmoke PRIVATE cxx_std_20)
+target_compile_definitions(DfgtBrokerStatusSmoke PRIVATE
+    UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_compile_options(DfgtBrokerStatusSmoke PRIVATE
+    /W4 /WX /permissive- /guard:cf)
+target_link_options(DfgtBrokerStatusSmoke PRIVATE
+    /guard:cf /DYNAMICBASE /NXCOMPAT)
+set_target_properties(DfgtBrokerStatusSmoke PROPERTIES
+    MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
 add_executable(DfgtAgent WIN32
     agent/DfgtAgent.cpp
     agent/ControlClient.cpp
