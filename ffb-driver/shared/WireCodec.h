@@ -300,7 +300,7 @@ inline bool Decode(
             static_cast<std::uint32_t>(Command::Ping) ||
         header.command >
             static_cast<std::uint32_t>(
-                Command::AcknowledgeAndRearm)) {
+                Command::PrepareForMaintenance)) {
         return false;
     }
     request = {};

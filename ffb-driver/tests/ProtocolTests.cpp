@@ -152,7 +152,20 @@ int main() {
         std::cerr << "control wire round trip mismatch\n";
         return 1;
     }
+    control = {};
+    control.command =
+        dfgt::ipc::control::Command::PrepareForMaintenance;
+    control.sequence = 8;
+    const auto maintenance =
+        dfgt::ipc::control::wire::Encode(control);
+    if (!dfgt::ipc::control::wire::Decode(
+            maintenance, decodedControl) ||
+        decodedControl.command !=
+            dfgt::ipc::control::Command::PrepareForMaintenance) {
+        std::cerr << "maintenance command rejected by wire codec\n";
+        return 1;
+    }
 
-    std::cout << "{\"protocolVectors\":20,\"passed\":true}\n";
+    std::cout << "{\"protocolVectors\":21,\"passed\":true}\n";
     return 0;
 }
