@@ -1360,6 +1360,13 @@ HRESULT ProcessControlRequest(
             state.device.SetRange(900);
             if (closeDevice) state.device.Close();
         }
+        if (closeDevice &&
+            result ==
+                HRESULT_FROM_WIN32(ERROR_DEVICE_NOT_CONNECTED)) {
+            // The inbox HID stack has already removed the physical device.
+            // Closing the stale handle is the only possible neutral state.
+            result = S_OK;
+        }
         {
             std::scoped_lock lock(state.stateMutex);
             if (SUCCEEDED(result)) {

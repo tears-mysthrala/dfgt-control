@@ -14,6 +14,12 @@ inline bool RequiresReconnect(
         state == dfgt::ipc::control::DeviceState::Faulted;
 }
 
+inline bool ShouldDetachMissingNativeDevice(
+    bool brokerReportsConnected,
+    bool nativeDevicePresent) noexcept {
+    return brokerReportsConnected && !nativeDevicePresent;
+}
+
 inline DWORD NextBrokerBackoff(DWORD current) noexcept {
     return std::min<DWORD>(
         std::max<DWORD>(current, 500) * 2,

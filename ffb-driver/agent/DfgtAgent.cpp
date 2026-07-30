@@ -229,6 +229,15 @@ private:
             control_.Close();
             activeProfile_.clear();
             ConnectDevice();
+        } else if (
+            dfgt::agent::ShouldDetachMissingNativeDevice(
+                status.connected != 0,
+                dfgt::agent::FindDfgtDevicePath().has_value())) {
+            control_.DetachDevice();
+            activeProfile_.clear();
+            nextAttachAttempt_ = GetTickCount64() + 2000;
+            UpdateTray(L"DFGT Control · volante desconectado");
+            return;
         } else if (dfgt::agent::RequiresReconnect(status.state)) {
             activeProfile_.clear();
             ConnectDevice();
@@ -535,8 +544,12 @@ private:
             return 0;
         }
         case WM_DEVICECHANGE:
-            if (wParam == DBT_DEVICEARRIVAL ||
-                wParam == DBT_DEVICEREMOVECOMPLETE) {
+            if (wParam == DBT_DEVICEREMOVECOMPLETE) {
+                control_.DetachDevice();
+                activeProfile_.clear();
+                nextAttachAttempt_ = GetTickCount64() + 2000;
+                UpdateTray(L"DFGT Control · volante desconectado");
+            } else if (wParam == DBT_DEVICEARRIVAL) {
                 nextAttachAttempt_ = 0;
                 activeProfile_.clear();
                 ConnectDevice();

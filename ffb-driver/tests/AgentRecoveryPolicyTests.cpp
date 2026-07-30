@@ -6,6 +6,7 @@ int wmain() {
     using dfgt::agent::NextBrokerBackoff;
     using dfgt::agent::RequiresReconnect;
     using dfgt::agent::ResumeMayAutomaticallyRearm;
+    using dfgt::agent::ShouldDetachMissingNativeDevice;
     using dfgt::ipc::SafetyMode;
     using dfgt::ipc::control::DeviceState;
 
@@ -13,6 +14,9 @@ int wmain() {
     ok &= RequiresReconnect(DeviceState::Disconnected);
     ok &= RequiresReconnect(DeviceState::Faulted);
     ok &= !RequiresReconnect(DeviceState::Ready);
+    ok &= ShouldDetachMissingNativeDevice(true, false);
+    ok &= !ShouldDetachMissingNativeDevice(true, true);
+    ok &= !ShouldDetachMissingNativeDevice(false, false);
     ok &= NextBrokerBackoff(0) == 1000;
     ok &= NextBrokerBackoff(500) == 1000;
     ok &= NextBrokerBackoff(20000) == 30000;
