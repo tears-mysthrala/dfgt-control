@@ -58,6 +58,21 @@ Invoke-Checked dotnet @(
     '--self-contained', 'true',
     '-o', (Join-Path $driver 'ui\publish'))
 
+$publishedUi = Join-Path $driver 'ui\publish\DfgtControl.exe'
+$uiProcess = Start-Process -FilePath $publishedUi -PassThru
+try {
+    Start-Sleep -Seconds 2
+    if ($uiProcess.HasExited) {
+        throw "Published UI exited during launch smoke with code $($uiProcess.ExitCode)."
+    }
+}
+finally {
+    if (-not $uiProcess.HasExited) {
+        Stop-Process -Id $uiProcess.Id -Force
+        $uiProcess.WaitForExit()
+    }
+}
+
 if (-not $SkipTests) {
     Invoke-Checked ctest @(
         '--test-dir', (Join-Path $driver 'build-x64'),
