@@ -10,6 +10,7 @@ inline constexpr std::uint32_t Magic = 0x55474644; // "DFGU"
 inline constexpr std::uint16_t Version = 1;
 inline constexpr std::uint16_t RequestSize = 16;
 inline constexpr std::uint16_t ResponseSize = 184;
+inline constexpr std::uint16_t AckSize = 4;
 
 enum class Command : std::uint32_t {
     GetStatus = 1,

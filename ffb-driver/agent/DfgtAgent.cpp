@@ -467,8 +467,20 @@ private:
                         response.activeProfileId,
                         call.status.activeProfileId,
                         _TRUNCATE);
-                    dfgt::io::WriteExact(
+                    const auto wrote = dfgt::io::WriteExact(
                         pipe, &response, sizeof(response), 500);
+                    if (wrote.Succeeded(sizeof(response))) {
+                        std::uint32_t acknowledgement = 0;
+                        const auto ack = dfgt::io::ReadExact(
+                            pipe,
+                            &acknowledgement,
+                            sizeof(acknowledgement),
+                            500);
+                        const auto acknowledged =
+                            ack.Succeeded(sizeof(acknowledgement)) &&
+                            acknowledgement == request.sequence;
+                        (void)acknowledged;
+                    }
                 }
             }
             DisconnectNamedPipe(pipe);

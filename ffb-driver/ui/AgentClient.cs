@@ -67,6 +67,11 @@ internal static class AgentClient
             BinaryPrimitives.ReadUInt32LittleEndian(response.AsSpan(8)) !=
                 requestSequence)
             throw new InvalidDataException("Respuesta IPC del agente inválida.");
+        var acknowledgement = new byte[4];
+        BinaryPrimitives.WriteUInt32LittleEndian(
+            acknowledgement, requestSequence);
+        await pipe.WriteAsync(acknowledgement, timeout.Token);
+        await pipe.FlushAsync(timeout.Token);
 
         var status = new AgentStatus(
             BinaryPrimitives.ReadInt32LittleEndian(response.AsSpan(12)),
@@ -79,7 +84,7 @@ internal static class AgentClient
             BinaryPrimitives.ReadInt32LittleEndian(response.AsSpan(40)),
             BinaryPrimitives.ReadUInt64LittleEndian(response.AsSpan(48)),
             ReadUtf16(response.AsSpan(56, 128)));
-        if (status.Result < 0)
+        if (status.Result < 0 && command != AgentCommand.GetStatus)
             throw new COMException(
                 "El agente rechazó la operación.", status.Result);
         return status;

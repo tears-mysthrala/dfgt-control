@@ -134,5 +134,16 @@ if ($broker -notmatch 'Command::PrepareForMaintenance' -or
     $broker -notmatch 'EnterMaintenanceSafe') {
     throw 'Maintenance does not handle an already-disconnected device safely.'
 }
+$agentPath = Join-Path (Split-Path -Parent $ScriptsDirectory) `
+    'agent\DfgtAgent.cpp'
+$agent = Get-Content -LiteralPath $agentPath -Raw
+$uiClientPath = Join-Path (Split-Path -Parent $ScriptsDirectory) `
+    'ui\AgentClient.cs'
+$uiClient = Get-Content -LiteralPath $uiClientPath -Raw
+if ($agent -notmatch 'acknowledgement == request\.sequence' -or
+    $uiClient -notmatch 'WriteUInt32LittleEndian\(\s*acknowledgement' -or
+    $uiClient -notmatch 'command != AgentCommand\.GetStatus') {
+    throw 'Agent UI status exchange lacks response acknowledgement or disconnected-status handling.'
+}
 
 Write-Output 'script safety invariants passed'
