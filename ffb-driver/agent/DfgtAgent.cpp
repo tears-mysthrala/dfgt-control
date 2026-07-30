@@ -191,10 +191,15 @@ private:
 
     bool ConnectDevice() {
         if (GetTickCount64() < nextAttachAttempt_) return false;
-        if (FAILED(EnsureBroker())) return false;
         const auto path = dfgt::agent::FindDfgtDevicePath();
-        if (!path || FAILED(control_.AttachDevice(*path))) {
+        if (!path) {
             UpdateTray(L"DFGT Control · volante desconectado");
+            nextAttachAttempt_ = GetTickCount64() + 2000;
+            return true;
+        }
+        if (FAILED(EnsureBroker())) return false;
+        if (FAILED(control_.AttachDevice(*path))) {
+            UpdateTray(L"DFGT Control · error al conectar volante");
             nextAttachAttempt_ = GetTickCount64() + 2000;
             return true;
         }
