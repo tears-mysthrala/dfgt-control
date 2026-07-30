@@ -31,7 +31,9 @@ USB VID_046D&PID_C29A
 ```
 
 Other wheels are not supported yet, even if they use similar Logitech
-protocols.
+protocols. A DFGT may initially appear as compatibility PID `C294`; the agent
+accepts only the DFGT `0x13xx` revision, switches it to `C29A`, and starts the
+broker only after native re-enumeration.
 
 ## Install
 

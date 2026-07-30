@@ -2,11 +2,11 @@
 
 ## Decision
 
-Recommended state: **private alpha**. The code, safe automated tests, static
-analysis and release package are ready for the final machine-validation pass.
-Do not label this a public beta until the disconnected upgrade/uninstall,
-arrival/removal, suspend/resume and schema-3 restore matrix in
-`TEST-MATRIX.md` has been executed against the release package.
+Recommended state: **private beta candidate**. Safe automated tests, static
+analysis, real disconnected lifecycle operations and native device arrival
+have passed on the project machine. Do not label this a public beta until
+suspend/resume, representative x64/x86 games, UI emergency/rearm and schema-3
+restore/fault injection have been executed as described in `TEST-MATRIX.md`.
 
 ## Changes tied to failures
 
@@ -27,6 +27,7 @@ arrival/removal, suspend/resume and schema-3 restore matrix in
 | Upgrade had no rollback | Manifest-verified staging, journal/complete markers, interrupted recovery, maintenance handshake and registry/file rollback | parser/invariant test; VM injection pending |
 | Restore/uninstall accepted unsafe rollback inputs | Schema-3 identity/hash allowlist and verified-INF-only `pnputil` restore | `script-safety-invariants`; VM restore pending |
 | Release evidence was incomplete | Self-contained UI, `/sdl`, CodeQL workflow, SBOM, commit manifest, checksum and attestations | local package inspection |
+| DFGT could remain in shared C294 compatibility mode | Revision-gated upstream EXT_CMD9 transition before broker startup | `dfgt-native-mode-switch`; physical C294-to-C29A arrival |
 
 ## Local commits not yet pushed
 
@@ -46,39 +47,47 @@ arrival/removal, suspend/resume and schema-3 restore matrix in
 - `4f0feb4` make packaged validation executable
 - `8a09f56` verify release provenance and live safety evidence
 - `b29da5b` make maintenance and profile writes transactional
+- `b781027` enter native DFGT mode on reconnect
 
 ## Automated results
 
-- Release CTest: 17/17 x64, 17/17 x86.
+- Release CTest: 18/18 x64, 18/18 x86.
 - WPF: Release self-contained build passed with zero warnings.
 - MSVC `/analyze`: passed after moving 131 KB peer-validation buffers from
   stack to heap and correcting API annotations/status checks.
 - COM exports: `DllGetClassObject` and `DllCanUnloadNow` present in x64/x86.
 - Mitigations: ASLR, NX and Control Flow Guard present in x64/x86; x64 also
   reports high-entropy VA.
-- Package:
-  `DfgtControl-v0.1.0-beta-local4-win.zip`
 - The generated `.sha256` and `release-manifest.json` are authoritative for
-  the final package digest and embedded commit.
+  each package digest and embedded commit. The final candidate is regenerated
+  only after the tracked evidence is committed.
 
 No automated test opened a physical HID path or produced force.
 
 ## Physical evidence
 
-Earlier interactive development verified the DFGT's constant,
-bidirectional, periodic, spring, damper, friction, range and emergency
-behaviour with a person present and limited magnitudes. No physical test was
-run during this final hardening pass.
+Earlier interactive development verified the DFGT's constant, bidirectional,
+periodic, spring, damper, friction, range and emergency behaviour with a person
+present and limited magnitudes.
+
+This hardening pass additionally verified startup while absent followed by
+arrival in `C294` compatibility mode, transition to native `C29A`, inbox
+Microsoft HID binding and a safe broker status. The wheel did not move during
+the mode transition. The observer reported that firmware autocenter was
+disabled when the native broker opened it, which is the expected neutralization
+sequence. The resulting state reported no FFB client, zero active slots and a
+confirmed stop.
+
+Disconnected install, old-to-new upgrade, new-to-new upgrade, uninstall and
+reinstall completed on the project machine. Manifest hashes, owned registry
+roots, x64/x86 COM activation, HVCI/VBS, Secure Boot in an elevated run, and
+broker handshake were verified.
 
 Still required against the packaged build:
 
-- disconnected transactional upgrade;
-- startup without wheel followed by plug-in;
-- unplug/replug while idle;
 - suspend/resume with no game, then with a controlled low-force effect;
 - UI emergency stop and explicit rearm;
 - one x64 and one x86 DirectInput game;
-- disconnected uninstall and reinstall;
 - schema-3 legacy restore in a disposable VM or recoverable test host.
 
 ## Known limitations and residual risk
@@ -87,12 +96,13 @@ Still required against the packaged build:
   measured end to end. Published jitter is scheduler-only.
 - Installer rollback structure has automated invariants but not injected
   registry/filesystem failures in a disposable VM.
-- Native UI bridge was compiled and reviewed but the installed old agent does
-  not expose it; live validation requires installing the packaged build.
+- The native UI emergency/rearm interaction still requires a live manual run
+  against the final installed package.
 - CodeQL/provenance changes are configured but remain unverified remotely
   until the branch is pushed once.
-- Secure Boot and HVCI were not disabled or modified by the hardening work;
-  the final verifier must capture their live state after installation.
+- Secure Boot and HVCI were not disabled or modified. An elevated disconnected
+  verifier confirmed both; a connected verifier confirmed HVCI/VBS, inbox HID,
+  COM and broker state. The final package should repeat that capture.
 
 ## Rollback
 

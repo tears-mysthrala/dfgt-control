@@ -24,10 +24,11 @@ Physical tests are excluded from CTest and GitHub Actions.
 | `profile-golden-csharp` | Pass | Pass | C++ and C# consume the same validation corpus |
 | `timing-jitter` | Pass | Pass | High-resolution 2 ms timer remains bounded |
 | `agent-recovery-policy` | Pass | Pass | Reconnect/backoff and no automatic rearm |
+| `dfgt-native-mode-switch` | Pass | Pass | C294 revision gate and upstream command vectors |
 | `script-safety-invariants` | Pass | Pass | Disconnect-before-kill, SID and restore allowlist |
 
 Last local run: Windows 11 build 26100, MSVC 19.44, SDK 10.0.26100.0,
-CMake 3.29.2 and .NET SDK 9.0.316. Result: 17/17 x64 and 17/17 x86.
+CMake 3.29.2 and .NET SDK 9.0.316. Result: 18/18 x64 and 18/18 x86.
 
 The local 1,000-sample timing run produced:
 
@@ -49,9 +50,23 @@ identified that the first range-boundary implementation behaved as constant
 resistance rather than a hard lock; the implementation was corrected and
 retested interactively.
 
-No physical test was executed during the beta-hardening automated run. In
-particular, unplug/replug, suspend/resume, upgrade, uninstall and legacy restore
-remain manual acceptance items. Record each future run with:
+The beta-hardening run also exercised the following person-observed operations
+on Windows 11 build 26100:
+
+- startup with the wheel absent, followed by USB arrival;
+- real `C294` compatibility identity, revision `0x1322`, transitioned to
+  native `C29A` using the upstream mode-switch sequence;
+- no wheel movement during the transition; opening the native device
+  intentionally disabled firmware autocenter as part of neutralization;
+- attached broker status: connected, no FFB client, zero active slots and
+  stop confirmed;
+- Microsoft `input.inf` on both nodes, `HidUsb` transport, no legacy filters,
+  HVCI/VBS running, x64/x86 COM activation and broker handshake;
+- disconnected install, old-to-new upgrade, new-to-new upgrade, uninstall and
+  reinstall with manifest/hash/registry ownership checks.
+
+Suspend/resume, representative games and schema-3 legacy restore remain manual
+acceptance items. Record each future run with:
 
 - Windows build and HVCI/Secure Boot state;
 - x86/x64 game/provider path;
@@ -63,10 +78,10 @@ remain manual acceptance items. Record each future run with:
 
 | Area | Current evidence | Required evidence |
 |---|---|---|
-| Windows 11 24H2/26100 + HVCI | Previously validated on project machine | Repeat against release ZIP |
-| Secure Boot | Previously reported enabled | Capture verifier result |
+| Windows 11 24H2/26100 + HVCI | Connected verifier pass; HVCI/VBS running | Repeat against final release ZIP |
+| Secure Boot | Elevated disconnected verifier reported enabled | Repeat after final package install |
 | x64 DirectInput | Automated COM/contract tests | Two representative games |
 | x86 DirectInput | Automated COM/contract tests | One 32-bit game |
 | Suspend/resume | Code path and compile only | Manual no-force-first run |
-| Upgrade/uninstall | Static/WhatIf and ownership checks | Disposable VM fault injection |
+| Upgrade/uninstall | Real disconnected install/upgrade/uninstall/reinstall passed | Disposable VM fault injection |
 | Legacy restore | Hash/identity allowlist and parser | Disposable VM with project snapshot |

@@ -47,7 +47,7 @@ Evidence labels used below:
 | LOCK-001 | P0 | Reproduced without hardware | Provider held effect mutex over pipe I/O. | provider | contract suite plus lock audit | Immutable render snapshots and separate render mutex | No pipe I/O under state mutex | Closed | No |
 | DI-001 | P0 | Reproduced without hardware | DirectInput flags/timing were incomplete. | provider | `directinput-contract`, `effect-timing` | Transactional DIEP/DIES handling | Partial/SOLO/INFINITE pass | Closed | No |
 | IPC-001 | P1 | Reproduced without hardware | Native structs lacked handshake framing. | shared protocol | `protocol-vectors`, `broker-framing-integration` | Explicit LE frames, nonce/capabilities/build | Mismatch fails closed | Closed | No |
-| PNP-001 | P0 | Reproduced without hardware | Agent retry/arrival handling was incomplete. | agent | `agent-recovery-policy`; physical transition pending | PnP notifications, polling fallback and capped backoff | Arrival after start attaches | Implemented; physical transition pending | No |
+| PNP-001 | P0 | Reproduced on physical DFGT | Agent retry/arrival handling was incomplete and did not enter native mode from C294. | agent | `agent-recovery-policy`, `dfgt-native-mode-switch`, real C294-to-C29A arrival | PnP notifications, polling fallback, capped backoff and revision-gated native transition | Arrival after start attaches as C29A | Closed | Yes |
 | PROF-001 | P1 | Reproduced without hardware | Validators were revisionless and divergent. | agent, UI | `profile-document-validation`, C# build | Revision/CAS, LKG, aligned constraints | Schema invariants agree | Closed | No |
 | PROF-002 | P1 | Reproduced without hardware | UI inferred health from process name. | UI | Native agent IPC build | Same-user agent status bridge | UI displays broker safety | Closed | No |
 | INST-001 | P0 | Reproduced without hardware | Elevated install wrote implicit HKCU. | installer | parser/WhatIf preflight | Explicit SID/profile and HKEY_USERS | Intended SID is explicit | Closed | No |
@@ -78,13 +78,13 @@ gate.
 | 11 | Same-slot conditions are deterministic | `effect-slot-isolation` | Pass |
 | 12 | `INFINITE` never becomes an artificial finite deadline | `effect-timing` | Pass |
 | 13 | `DIES_SOLO` and partial `DIEP` updates | `directinput-contract` | Pass |
-| 14 | Agent recovers absent-at-start and unplug/replug | `agent-recovery-policy`; real PnP transition pending | Pending manual |
-| 15 | Upgrade/uninstall never kill an attached broker first | `script-safety-invariants`; disconnected transactional run pending | Pending manual |
+| 14 | Agent recovers absent-at-start and unplug/replug | `agent-recovery-policy`; real absent-start C294-to-C29A arrival attached | Pass |
+| 15 | Upgrade/uninstall never kill an attached broker first | `script-safety-invariants`; real disconnected install/upgrade/uninstall/reinstall | Pass |
 | 16 | Elevation under different credentials targets intended user | explicit SID/hive invariant; secondary-credential VM run pending | Pending manual |
 | 17 | COM providers activate in x64 and x86 | packaged `DfgtFfbComSmoke.exe`, both architectures | Pass |
 | 18 | CI executes rather than merely builds tests | local release pipeline ran 16/16 on x64 and x86; remote workflow pending one grouped push | Pass locally |
 | 19 | Automated tests produce no physical force | broker integration requires `--diagnostics-no-force` and receives no HID path | Pass |
-| 20 | HVCI and Secure Boot are never disabled | script audit plus verifier; installed-release capture pending | Pass in code, pending live capture |
+| 20 | HVCI and Secure Boot are never disabled | script audit; elevated verifier confirmed both; connected verifier confirmed HVCI/VBS and inbox HID | Pass on test host |
 
 ## Safety release rule
 
