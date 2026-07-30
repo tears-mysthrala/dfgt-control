@@ -57,7 +57,7 @@ broker only after native re-enumeration.
 
    ```powershell
    .\scripts\Install-DfgtFfb.ps1 `
-     -ExpectedVersion '0.1.0-beta-local4' `
+     -ExpectedVersion '0.1.0-beta.1' `
      -TargetUserSid ([Security.Principal.WindowsIdentity]::GetCurrent().User.Value) `
      -TargetUserProfile ([Environment]::GetFolderPath('UserProfile')) `
      -Confirm:$false
