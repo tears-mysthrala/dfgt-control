@@ -72,10 +72,16 @@ if ($install -notmatch '\.dfgt-transaction\.json' -or
     $install -notmatch 'Recovered the previous installation') {
     throw 'Installer lacks journal, complete marker or interrupted recovery.'
 }
-if ($install -notmatch 'DfgtBrokerStatusSmoke\.exe' -or
-    $install -notmatch '\$status\.connected -ne 0' -or
-    $install -notmatch '\$status\.ffbClientConnected -ne 0') {
-    throw 'Legacy maintenance fallback does not prove a disconnected idle broker.'
+foreach ($entry in @(
+    @{ Name = 'installer'; Text = $install },
+    @{ Name = 'uninstaller'; Text = $uninstall })) {
+    if ($entry.Text -notmatch 'DfgtBrokerStatusSmoke\.exe' -or
+        $entry.Text -notmatch '\$status\.ffbClientConnected -eq 0' -or
+        $entry.Text -notmatch '\$status\.activeSlots -eq 0' -or
+        $entry.Text -notmatch 'deviceNotConnected' -or
+        $entry.Text -notmatch 'Get-PnpDevice -PresentOnly -ErrorAction Stop') {
+        throw "$($entry.Name) does not fail closed while proving an absent idle broker."
+    }
 }
 if ($restore -match '(?i)reg\.exe\s+import' -or
     $restore -notmatch '(?i)pnputil\.exe\s+/add-driver' -or

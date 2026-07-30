@@ -89,10 +89,15 @@ function Remove-OwnedForceFeedbackRoot {
 }
 
 if ($PSCmdlet.ShouldProcess($resolvedInstallRoot, 'Remove DFGT user-mode FFB stack')) {
-    $presentDfgt = @(
-        Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue |
-            Where-Object InstanceId -like '*VID_046D&PID_C29A*'
-    )
+    $presentDfgt = try {
+        @(
+            Get-PnpDevice -PresentOnly -ErrorAction Stop |
+                Where-Object InstanceId -like '*VID_046D&PID_C29A*'
+        )
+    }
+    catch {
+        throw "Could not prove DFGT disconnection: $($_.Exception.Message)"
+    }
     if ($presentDfgt) {
         throw 'Disconnect the DFGT before uninstall. No process or registration has been changed.'
     }
@@ -124,7 +129,27 @@ if ($PSCmdlet.ShouldProcess($resolvedInstallRoot, 'Remove DFGT user-mode FFB sta
         (Test-Path -LiteralPath $maintenanceTool -PathType Leaf)) {
         & $maintenanceTool | Out-Null
         if ($LASTEXITCODE -ne 0) {
-            throw 'PrepareForMaintenance was not confirmed. Close games and retry while disconnected.'
+            $statusTool = Join-Path $resolvedInstallRoot `
+                'bin\x64\DfgtBrokerStatusSmoke.exe'
+            $statusOutput = if (Test-Path -LiteralPath $statusTool `
+                    -PathType Leaf) {
+                & $statusTool 2>$null | Out-String
+            }
+            else { $null }
+            $status = try {
+                $statusOutput | ConvertFrom-Json
+            }
+            catch { $null }
+            $deviceNotConnected = -2147023729
+            $safeAbsentState =
+                $null -ne $status -and
+                $status.ffbClientConnected -eq 0 -and
+                $status.activeSlots -eq 0 -and
+                ($status.connected -eq 0 -or
+                 $status.lastSafetyError -eq $deviceNotConnected)
+            if (-not $safeAbsentState) {
+                throw 'PrepareForMaintenance was not confirmed. Close games and retry while disconnected.'
+            }
         }
     }
     Get-CimInstance Win32_Process |

@@ -418,10 +418,15 @@ if ($PSCmdlet.ShouldProcess($InstallRoot, 'Install DFGT user-mode FFB stack and 
         if ($unowned) {
             throw "Upgrade would move unowned files: $($unowned.FullName -join ', ')"
         }
-        $presentDfgt = @(
-            Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue |
-                Where-Object InstanceId -like '*VID_046D&PID_C29A*'
-        )
+        $presentDfgt = try {
+            @(
+                Get-PnpDevice -PresentOnly -ErrorAction Stop |
+                    Where-Object InstanceId -like '*VID_046D&PID_C29A*'
+            )
+        }
+        catch {
+            throw "Could not prove DFGT disconnection: $($_.Exception.Message)"
+        }
         if ($presentDfgt) {
             throw 'Disconnect the DFGT before upgrade. No process has been stopped.'
         }
@@ -459,9 +464,15 @@ if ($PSCmdlet.ShouldProcess($InstallRoot, 'Install DFGT user-mode FFB stack and 
                         $statusOutput | ConvertFrom-Json
                     }
                     catch { $null }
-                    if ($null -eq $status -or
-                        $status.connected -ne 0 -or
-                        $status.ffbClientConnected -ne 0) {
+                    $deviceNotConnected = -2147023729
+                    $safeAbsentState =
+                        $null -ne $status -and
+                        $status.ffbClientConnected -eq 0 -and
+                        $status.activeSlots -eq 0 -and
+                        ($status.connected -eq 0 -or
+                         $status.lastSafetyError -eq
+                            $deviceNotConnected)
+                    if (-not $safeAbsentState) {
                         throw 'PrepareForMaintenance was not confirmed. Close games and retry with the wheel disconnected.'
                     }
                 }
