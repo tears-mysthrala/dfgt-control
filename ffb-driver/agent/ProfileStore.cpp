@@ -10,8 +10,10 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <filesystem>
+#include <set>
 #include <string_view>
 
 namespace dfgt::agent {
@@ -36,7 +38,7 @@ std::wstring LocalDataDirectory() {
     return path;
 }
 
-bool ReadUtf8File(
+ProfileLoadResult ReadUtf8File(
     const std::wstring& path,
     std::wstring& output) {
     const auto file = CreateFileW(
@@ -47,13 +49,26 @@ bool ReadUtf8File(
         OPEN_EXISTING,
         FILE_ATTRIBUTE_NORMAL,
         nullptr);
-    if (file == INVALID_HANDLE_VALUE) return false;
+    if (file == INVALID_HANDLE_VALUE) {
+        switch (GetLastError()) {
+        case ERROR_FILE_NOT_FOUND:
+        case ERROR_PATH_NOT_FOUND:
+            return ProfileLoadResult::Missing;
+        case ERROR_ACCESS_DENIED:
+            return ProfileLoadResult::AccessDenied;
+        case ERROR_SHARING_VIOLATION:
+        case ERROR_LOCK_VIOLATION:
+            return ProfileLoadResult::SharingViolation;
+        default:
+            return ProfileLoadResult::TransientFailure;
+        }
+    }
     LARGE_INTEGER size{};
     if (!GetFileSizeEx(file, &size) ||
         size.QuadPart < 0 ||
         size.QuadPart > 1024 * 1024) {
         CloseHandle(file);
-        return false;
+        return ProfileLoadResult::InvalidData;
     }
     std::string bytes(static_cast<std::size_t>(size.QuadPart), '\0');
     DWORD read = 0;
@@ -66,8 +81,8 @@ bool ReadUtf8File(
              nullptr) &&
          read == bytes.size());
     CloseHandle(file);
-    if (!ok) return false;
-    if (bytes.empty()) return false;
+    if (!ok) return ProfileLoadResult::PartialRead;
+    if (bytes.empty()) return ProfileLoadResult::InvalidData;
     const auto characters = MultiByteToWideChar(
         CP_UTF8,
         MB_ERR_INVALID_CHARS,
@@ -75,7 +90,7 @@ bool ReadUtf8File(
         static_cast<int>(bytes.size()),
         nullptr,
         0);
-    if (characters <= 0) return false;
+    if (characters <= 0) return ProfileLoadResult::InvalidData;
     output.resize(characters);
     return MultiByteToWideChar(
                CP_UTF8,
@@ -83,7 +98,9 @@ bool ReadUtf8File(
                bytes.data(),
                static_cast<int>(bytes.size()),
                output.data(),
-               characters) == characters;
+               characters) == characters
+        ? ProfileLoadResult::Loaded
+        : ProfileLoadResult::InvalidData;
 }
 
 bool WriteUtf8Atomically(
@@ -112,15 +129,28 @@ bool WriteUtf8Atomically(
         return false;
     }
 
-    const auto temporary = path + L".tmp";
-    const auto file = CreateFileW(
-        temporary.c_str(),
-        GENERIC_WRITE,
-        0,
-        nullptr,
-        CREATE_ALWAYS,
-        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH,
-        nullptr);
+    std::wstring temporary;
+    HANDLE file = INVALID_HANDLE_VALUE;
+    for (unsigned attempt = 0;
+         attempt < 32 && file == INVALID_HANDLE_VALUE;
+         ++attempt) {
+        temporary = path + L"." +
+            std::to_wstring(GetCurrentProcessId()) + L"." +
+            std::to_wstring(GetTickCount64()) + L"." +
+            std::to_wstring(attempt) + L".tmp";
+        file = CreateFileW(
+            temporary.c_str(),
+            GENERIC_WRITE,
+            0,
+            nullptr,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH,
+            nullptr);
+        if (file == INVALID_HANDLE_VALUE &&
+            GetLastError() != ERROR_FILE_EXISTS) {
+            return false;
+        }
+    }
     if (file == INVALID_HANDLE_VALUE) return false;
     DWORD written = 0;
     const auto wrote = WriteFile(
@@ -135,11 +165,21 @@ bool WriteUtf8Atomically(
         DeleteFileW(temporary.c_str());
         return false;
     }
-    if (!MoveFileExW(
-            temporary.c_str(),
-            path.c_str(),
-            MOVEFILE_REPLACE_EXISTING |
-                MOVEFILE_WRITE_THROUGH)) {
+    const auto exists =
+        GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES;
+    const auto replaced = exists
+        ? ReplaceFileW(
+              path.c_str(),
+              temporary.c_str(),
+              (path + L".last-good").c_str(),
+              REPLACEFILE_WRITE_THROUGH,
+              nullptr,
+              nullptr)
+        : MoveFileExW(
+              temporary.c_str(),
+              path.c_str(),
+              MOVEFILE_WRITE_THROUGH);
+    if (!replaced) {
         DeleteFileW(temporary.c_str());
         return false;
     }
@@ -170,6 +210,95 @@ void InsertNumber(
         JsonValue::CreateNumberValue(value));
 }
 
+class ProfileWriteLock final {
+public:
+    explicit ProfileWriteLock(const std::wstring& path)
+        : path_(path + L".lock"),
+          handle_(CreateFileW(
+              path_.c_str(), GENERIC_READ | GENERIC_WRITE, 0,
+              nullptr, CREATE_NEW,
+              FILE_ATTRIBUTE_HIDDEN | FILE_FLAG_WRITE_THROUGH,
+              nullptr)) {}
+    ~ProfileWriteLock() {
+        if (handle_ != INVALID_HANDLE_VALUE) {
+            CloseHandle(handle_);
+            DeleteFileW(path_.c_str());
+        }
+    }
+    [[nodiscard]] bool Acquired() const noexcept {
+        return handle_ != INVALID_HANDLE_VALUE;
+    }
+private:
+    std::wstring path_;
+    HANDLE handle_{INVALID_HANDLE_VALUE};
+};
+
+bool CurrentRevision(
+    const std::wstring& path,
+    std::int32_t& revision,
+    bool& missing) {
+    std::wstring text;
+    const auto read = ReadUtf8File(path, text);
+    missing = read == ProfileLoadResult::Missing;
+    if (missing) {
+        revision = 0;
+        return true;
+    }
+    if (read != ProfileLoadResult::Loaded) return false;
+    try {
+        const auto root = JsonObject::Parse(text);
+        revision = 0;
+        return !root.HasKey(L"revision") ||
+            (Integer(root, L"revision", revision) && revision >= 0);
+    } catch (...) {
+        return false;
+    }
+}
+
+void RecoverInterruptedWrite(const std::wstring& path) noexcept {
+    try {
+        namespace fs = std::filesystem;
+        const fs::path profile(path);
+        const auto lock = fs::path(path + L".lock");
+        std::error_code error;
+        if (fs::exists(lock, error)) {
+            const auto age = fs::file_time_type::clock::now() -
+                fs::last_write_time(lock, error);
+            if (!error && age > std::chrono::minutes(5))
+                fs::remove(lock, error);
+            else
+                return;
+        }
+        std::vector<fs::path> temporaries;
+        const auto prefix = profile.filename().wstring() + L".";
+        for (const auto& entry :
+             fs::directory_iterator(profile.parent_path(), error)) {
+            if (error || !entry.is_regular_file(error)) continue;
+            const auto name = entry.path().filename().wstring();
+            if (name.starts_with(prefix) && name.ends_with(L".tmp"))
+                temporaries.push_back(entry.path());
+        }
+        if (!fs::exists(profile, error)) {
+            const auto lastGood = fs::path(path + L".last-good");
+            if (fs::exists(lastGood, error)) {
+                fs::copy_file(lastGood, profile, error);
+            } else if (!temporaries.empty()) {
+                const auto newest = std::ranges::max_element(
+                    temporaries,
+                    [&](const auto& left, const auto& right) {
+                        return fs::last_write_time(left, error) <
+                            fs::last_write_time(right, error);
+                    });
+                if (newest != temporaries.end())
+                    fs::rename(*newest, profile, error);
+            }
+        }
+        for (const auto& temporary : temporaries)
+            fs::remove(temporary, error);
+    } catch (...) {
+    }
+}
+
 } // namespace
 
 ProfileStore::ProfileStore() {
@@ -177,30 +306,44 @@ ProfileStore::ProfileStore() {
     if (directory.empty()) return;
     std::error_code error;
     std::filesystem::create_directories(directory, error);
-    if (!error) path_ = directory + L"\\profiles.json";
+    if (!error) {
+        path_ = directory + L"\\profiles.json";
+        RecoverInterruptedWrite(path_);
+    }
 }
 
-bool ProfileStore::Load(
+ProfileStore::ProfileStore(std::wstring path)
+    : path_(std::move(path)) {
+    RecoverInterruptedWrite(path_);
+}
+
+ProfileLoadResult ProfileStore::Load(
     std::vector<ProfileModel>& profiles) {
     profiles.clear();
-    if (path_.empty()) return false;
-    if (GetFileAttributesW(path_.c_str()) ==
-        INVALID_FILE_ATTRIBUTES) {
-        profiles.push_back(DesktopProfile());
-        return Save(profiles);
-    }
+    if (path_.empty()) return ProfileLoadResult::TransientFailure;
 
     try {
         std::wstring text;
-        if (!ReadUtf8File(path_, text)) return false;
-        const auto root = JsonObject::Parse(text);
+        const auto readResult = ReadUtf8File(path_, text);
+        if (readResult != ProfileLoadResult::Loaded) return readResult;
+        JsonObject root;
+        try {
+            root = JsonObject::Parse(text);
+        } catch (...) {
+            return ProfileLoadResult::InvalidJson;
+        }
         std::int32_t schema = 0;
-        if (!Integer(root, L"schemaVersion", schema) ||
-            schema != 1) {
-            return false;
+        if (!Integer(root, L"schemaVersion", schema))
+            return ProfileLoadResult::InvalidData;
+        if (schema != 1) return ProfileLoadResult::UnsupportedSchema;
+        std::int32_t revision = 0;
+        if (root.HasKey(L"revision") &&
+            (!Integer(root, L"revision", revision) || revision < 0)) {
+            return ProfileLoadResult::InvalidData;
         }
         const auto values = root.GetNamedArray(L"profiles");
-        if (values.Size() == 0 || values.Size() > 256) return false;
+        if (values.Size() == 0 || values.Size() > 256)
+            return ProfileLoadResult::InvalidData;
         for (const auto& value : values) {
             const auto object = value.GetObject();
             ProfileModel profile{};
@@ -241,13 +384,16 @@ bool ProfileStore::Load(
                     L"periodicGain",
                     profile.hardware.periodicGain) ||
                 !Validate(profile)) {
-                return false;
+                return ProfileLoadResult::InvalidData;
             }
             profiles.push_back(std::move(profile));
         }
-        return true;
+        if (!ValidateDocument(profiles))
+            return ProfileLoadResult::InvalidData;
+        revision_ = revision;
+        return ProfileLoadResult::Loaded;
     } catch (...) {
-        return false;
+        return ProfileLoadResult::InvalidData;
     }
 }
 
@@ -256,12 +402,22 @@ bool ProfileStore::Save(
     if (path_.empty() ||
         profiles.empty() ||
         profiles.size() > 256 ||
-        !std::ranges::all_of(profiles, Validate)) {
+        !ValidateDocument(profiles)) {
+        return false;
+    }
+    ProfileWriteLock writeLock(path_);
+    if (!writeLock.Acquired()) return false;
+    std::int32_t diskRevision = 0;
+    bool missing = false;
+    if (!CurrentRevision(path_, diskRevision, missing) ||
+        (!missing && diskRevision != revision_)) {
         return false;
     }
     try {
         JsonObject root;
         InsertNumber(root, L"schemaVersion", 1);
+        if (revision_ == INT32_MAX) return false;
+        InsertNumber(root, L"revision", revision_ + 1);
         JsonArray values;
         for (const auto& profile : profiles) {
             JsonObject object;
@@ -307,9 +463,11 @@ bool ProfileStore::Save(
             values.Append(object);
         }
         root.Insert(L"profiles", values);
-        return WriteUtf8Atomically(
+        const auto written = WriteUtf8Atomically(
             path_,
             root.Stringify().c_str());
+        if (written) ++revision_;
+        return written;
     } catch (...) {
         return false;
     }
@@ -398,6 +556,38 @@ bool ProfileStore::Validate(
         gain(data.damperGain) &&
         gain(data.frictionGain) &&
         gain(data.periodicGain);
+}
+
+bool ProfileStore::ValidateDocument(
+    const std::vector<ProfileModel>& profiles) noexcept {
+    try {
+        if (profiles.empty() || profiles.size() > 256) return false;
+        std::set<std::wstring, std::less<>> ids;
+        std::set<std::wstring, std::less<>> executables;
+        std::size_t desktopCount = 0;
+        for (const auto& profile : profiles) {
+            if (!Validate(profile)) return false;
+            std::wstring id(profile.hardware.id);
+            std::ranges::transform(id, id.begin(), towlower);
+            if (!ids.insert(id).second) return false;
+            if (id == L"desktop") {
+                ++desktopCount;
+                if (!profile.executablePath.empty()) return false;
+            }
+            if (!profile.executablePath.empty()) {
+                auto executable = std::filesystem::path(
+                    profile.executablePath).lexically_normal().wstring();
+                std::ranges::transform(
+                    executable,
+                    executable.begin(),
+                    towlower);
+                if (!executables.insert(executable).second) return false;
+            }
+        }
+        return desktopCount == 1;
+    } catch (...) {
+        return false;
+    }
 }
 
 } // namespace dfgt::agent

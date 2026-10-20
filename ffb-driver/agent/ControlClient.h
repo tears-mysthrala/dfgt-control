@@ -21,7 +21,9 @@ public:
     HRESULT ApplyProfile(
         const dfgt::ipc::control::Profile& profile) noexcept;
     HRESULT EmergencyStop() noexcept;
+    HRESULT AcknowledgeAndRearm() noexcept;
     HRESULT DetachDevice() noexcept;
+    HRESULT PrepareForMaintenance() noexcept;
     HRESULT GetStatus(
         dfgt::ipc::control::Status& status) noexcept;
 
@@ -32,6 +34,7 @@ private:
 
     HANDLE pipe_{INVALID_HANDLE_VALUE};
     std::uint32_t sequence_{0};
+    std::uint64_t sessionNonce_{0};
 };
 
 } // namespace dfgt::agent

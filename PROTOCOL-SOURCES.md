@@ -15,6 +15,11 @@ Primary references:
 Known DFGT facts used by the implementation:
 
 - Native USB identity: `VID_046D&PID_C29A`.
+- The DFGT can enumerate in shared Driving Force compatibility mode as
+  `VID_046D&PID_C294`, revision `0x13xx`.
+- Native-mode transition uses `F8 0A 00 00 00 00 00` followed by
+  `F8 09 03 01 00 00 00`. The second command detaches and re-enumerates the
+  device as `C29A`; the broker is not started until that identity is present.
 - HID output report: report ID `0x00` plus a seven-byte payload.
 - Range command: `F8 81 <degrees-low> <degrees-high> 00 00 00`.
 - Stop all: `F3 00 00 00 00 00 00`.

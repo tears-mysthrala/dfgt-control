@@ -12,11 +12,16 @@
 #include <mutex>
 #include <new>
 #include <numbers>
+#include <system_error>
 #include <thread>
 #include <unordered_map>
 #include <vector>
 
 #include "../shared/BrokerProtocol.h"
+#include "../shared/BoundedIo.h"
+#include "../shared/EffectTiming.h"
+#include "../shared/WireCodec.h"
+#include "../shared/PipePeerValidation.h"
 
 // {806A045D-E7E8-491E-A607-31495A7BF4A3}
 static constexpr GUID CLSID_DfgtDirectInputFfb{
@@ -44,6 +49,19 @@ constexpr DWORD kFirstEffectHandle = 1;
 constexpr std::size_t kMaximumEffects = 16;
 constexpr DWORD kFirmwareRevision = 0x1322;
 constexpr DWORD kDriverVersion = 0x00010000;
+constexpr DWORD kPipeIoTimeoutMs = 250;
+constexpr DWORD kMinimumEffectPeriodUs = 2000;
+constexpr DWORD kKnownDownloadFlags =
+    DIEP_DURATION | DIEP_SAMPLEPERIOD | DIEP_GAIN |
+    DIEP_TRIGGERBUTTON | DIEP_TRIGGERREPEATINTERVAL |
+    DIEP_AXES | DIEP_DIRECTION | DIEP_ENVELOPE |
+    DIEP_TYPESPECIFICPARAMS | DIEP_START |
+    DIEP_NORESTART | DIEP_NODOWNLOAD | DIEP_STARTDELAY;
+constexpr DWORD kEffectParameterFlags =
+    DIEP_DURATION | DIEP_SAMPLEPERIOD | DIEP_GAIN |
+    DIEP_TRIGGERBUTTON | DIEP_TRIGGERREPEATINTERVAL |
+    DIEP_AXES | DIEP_DIRECTION | DIEP_ENVELOPE |
+    DIEP_TYPESPECIFICPARAMS | DIEP_STARTDELAY;
 
 void LogDiagnostic(const char* format, ...) noexcept {
     wchar_t enabled[2]{};
@@ -96,7 +114,7 @@ public:
         : heartbeat_([this](std::stop_token stop) { HeartbeatLoop(stop); }) {}
 
     ~BrokerTransport() {
-        active_ = false;
+        activeSlots_ = 0;
         heartbeat_.request_stop();
         heartbeatWake_.notify_all();
         StopAll();
@@ -117,9 +135,23 @@ public:
                 0,
                 nullptr,
                 OPEN_EXISTING,
-                0,
+                FILE_FLAG_OVERLAPPED,
                 nullptr);
             if (pipe_ == INVALID_HANDLE_VALUE) return HRESULT_FROM_WIN32(GetLastError());
+            HMODULE providerModule = nullptr;
+            if (!GetModuleHandleExW(
+                    GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                    reinterpret_cast<LPCWSTR>(&g_objects),
+                    &providerModule) ||
+                !dfgt::ipc::ValidatePipeServer(
+                    pipe_,
+                    providerModule,
+                    L"DfgtFfbBroker.exe")) {
+                CloseHandle(pipe_);
+                pipe_ = INVALID_HANDLE_VALUE;
+                return E_ACCESSDENIED;
+            }
             DWORD mode = PIPE_READMODE_MESSAGE;
             if (!SetNamedPipeHandleState(pipe_, &mode, nullptr, nullptr)) {
                 const auto result = HRESULT_FROM_WIN32(GetLastError());
@@ -143,7 +175,7 @@ public:
     }
 
     void Close() noexcept {
-        active_ = false;
+        activeSlots_ = 0;
         std::scoped_lock lock(mutex_);
         if (pipe_ == INVALID_HANDLE_VALUE) return;
         dfgt::ipc::Message message{};
@@ -151,6 +183,8 @@ public:
         SendLocked(message);
         CloseHandle(pipe_);
         pipe_ = INVALID_HANDLE_VALUE;
+        sessionNonce_ = 0;
+        connected_ = false;
     }
 
     HRESULT Constant(
@@ -162,16 +196,23 @@ public:
         message.auxiliary =
             std::clamp(periodicMagnitude, -10000, 10000);
         const auto result = Send(message);
-        active_ = SUCCEEDED(result) &&
-            (magnitude != 0 || periodicMagnitude != 0);
+        if (SUCCEEDED(result)) {
+            SetSlot(kSoftwareSlot,
+                magnitude != 0 || periodicMagnitude != 0);
+        }
         heartbeatWake_.notify_all();
         return result;
     }
 
-    HRESULT StopSlotOne() noexcept { return StopAll(); }
+    HRESULT StopSlotOne() noexcept {
+        SetSlot(kSoftwareSlot, false);
+        dfgt::ipc::Message message{};
+        message.command = dfgt::ipc::Command::StopSoftwareSlot;
+        return Send(message);
+    }
 
     HRESULT StopAll() noexcept {
-        active_ = false;
+        activeSlots_ = 0;
         dfgt::ipc::Message message{};
         message.command = dfgt::ipc::Command::StopAll;
         return Send(message);
@@ -201,12 +242,45 @@ public:
         message.value6 = static_cast<std::int32_t>(
             std::min<DWORD>(positiveSaturation, 10000));
         const auto result = Send(message);
-        active_ = SUCCEEDED(result);
+        if (SUCCEEDED(result)) {
+            const auto slot = command == dfgt::ipc::Command::Spring
+                ? kSpringSlot
+                : command == dfgt::ipc::Command::Friction
+                    ? kFrictionSlot
+                    : kDamperSlot;
+            SetSlot(slot, true);
+        }
         heartbeatWake_.notify_all();
         return result;
     }
 
+    void UpdateRenderEpoch(std::uint64_t epoch) noexcept {
+        renderEpoch_.store(epoch, std::memory_order_release);
+    }
+
+    [[nodiscard]] dfgt::ipc::SafetyMode SafetyMode() const noexcept {
+        return static_cast<dfgt::ipc::SafetyMode>(
+            safetyMode_.load(std::memory_order_acquire));
+    }
+
+    [[nodiscard]] bool BrokerConnected() const noexcept {
+        return connected_.load(std::memory_order_acquire);
+    }
+
 private:
+    static constexpr std::uint32_t kSoftwareSlot = 1u << 0;
+    static constexpr std::uint32_t kSpringSlot = 1u << 1;
+    static constexpr std::uint32_t kDamperSlot = 1u << 2;
+    static constexpr std::uint32_t kFrictionSlot = 1u << 3;
+
+    void SetSlot(std::uint32_t slot, bool active) noexcept {
+        if (active) {
+            activeSlots_.fetch_or(slot);
+        } else {
+            activeSlots_.fetch_and(~slot);
+        }
+    }
+
     HRESULT Send(dfgt::ipc::Message& message) noexcept {
         std::scoped_lock lock(mutex_);
         return SendLocked(message);
@@ -215,24 +289,47 @@ private:
     HRESULT SendLocked(dfgt::ipc::Message& message) noexcept {
         if (pipe_ == INVALID_HANDLE_VALUE) return DIERR_NOTINITIALIZED;
         message.sequence = ++sequence_;
-        DWORD written = 0;
-        if (!WriteFile(pipe_, &message, sizeof(message), &written, nullptr) ||
-            written != sizeof(message)) {
-            return HRESULT_FROM_WIN32(GetLastError());
+        message.capabilities = dfgt::ipc::RequiredCapabilities;
+        message.buildId = dfgt::ipc::BuildId;
+        message.sessionNonce =
+            message.command == dfgt::ipc::Command::Open
+            ? 0
+            : sessionNonce_;
+        const auto encoded = dfgt::ipc::wire::Encode(message);
+        const auto write = dfgt::io::WriteExact(
+            pipe_, encoded.data(),
+            static_cast<DWORD>(encoded.size()),
+            kPipeIoTimeoutMs);
+        if (!write.Succeeded(
+                static_cast<DWORD>(encoded.size()))) {
+            return write.result;
         }
 
         dfgt::ipc::Response response{};
-        DWORD read = 0;
-        if (!ReadFile(pipe_, &response, sizeof(response), &read, nullptr) ||
-            read != sizeof(response)) {
-            return HRESULT_FROM_WIN32(GetLastError());
+        dfgt::ipc::wire::EncodedResponse encodedResponse{};
+        const auto read = dfgt::io::ReadExact(
+            pipe_, encodedResponse.data(),
+            static_cast<DWORD>(encodedResponse.size()),
+            kPipeIoTimeoutMs);
+        if (!read.Succeeded(
+                static_cast<DWORD>(encodedResponse.size()))) {
+            return read.result;
         }
-        if (response.magic != dfgt::ipc::Magic ||
-            response.version != dfgt::ipc::Version ||
-            response.size != sizeof(response) ||
+        if (!dfgt::ipc::wire::Decode(
+                encodedResponse, response) ||
             response.sequence != message.sequence) {
             return E_FAIL;
         }
+        if (message.command == dfgt::ipc::Command::Open) {
+            if (response.sessionNonce == 0) return E_ACCESSDENIED;
+            sessionNonce_ = response.sessionNonce;
+        } else if (response.sessionNonce != sessionNonce_) {
+            return E_ACCESSDENIED;
+        }
+        safetyMode_.store(
+            response.safetyMode, std::memory_order_release);
+        connected_.store(
+            response.connected != 0, std::memory_order_release);
         return response.result;
     }
 
@@ -241,17 +338,25 @@ private:
         std::unique_lock waitLock(waitMutex);
         while (!stop.stop_requested()) {
             heartbeatWake_.wait_for(waitLock, std::chrono::milliseconds(100));
-            if (stop.stop_requested() || !active_) continue;
+            if (stop.stop_requested() || activeSlots_.load() == 0) continue;
             dfgt::ipc::Message message{};
             message.command = dfgt::ipc::Command::Heartbeat;
-            if (FAILED(Send(message))) active_ = false;
+            message.renderEpoch =
+                renderEpoch_.load(std::memory_order_acquire);
+            if (FAILED(Send(message))) activeSlots_ = 0;
         }
     }
 
     HANDLE pipe_{INVALID_HANDLE_VALUE};
     std::mutex mutex_;
-    std::atomic<bool> active_{false};
+    std::atomic<std::uint32_t> activeSlots_{0};
+    std::atomic<std::uint64_t> renderEpoch_{0};
+    std::atomic<std::uint32_t> safetyMode_{
+        static_cast<std::uint32_t>(
+            dfgt::ipc::SafetyMode::Disconnected)};
+    std::atomic<bool> connected_{false};
     std::uint32_t sequence_{};
+    std::uint64_t sessionNonce_{};
     std::condition_variable heartbeatWake_;
     std::jthread heartbeat_;
 };
@@ -341,13 +446,17 @@ public:
             "DeviceID begin=%lu externalId=%lu",
             static_cast<unsigned long>(begin),
             static_cast<unsigned long>(externalId));
-        std::scoped_lock lock(stateMutex_);
         if (begin == 0) {
-            transport_.StopAll();
-            lastRendered_ = 0;
+            {
+                std::scoped_lock lock(stateMutex_);
+                lastRendered_ = 0;
+                lastPeriodicRendered_ = 0;
+                effects_.clear();
+                externalId_ = 0;
+            }
+            const auto stopped = transport_.StopAll();
             transport_.Close();
-            effects_.clear();
-            externalId_ = 0;
+            if (FAILED(stopped)) return stopped;
             return S_OK;
         }
         if (initInfo == nullptr) return E_INVALIDARG;
@@ -357,9 +466,12 @@ public:
         }
         const auto result = transport_.Open(info->pwszDeviceInterface);
         if (FAILED(result)) return result;
-        externalId_ = externalId;
-        actuatorsEnabled_ = true;
-        paused_ = false;
+        {
+            std::scoped_lock lock(stateMutex_);
+            externalId_ = externalId;
+            actuatorsEnabled_ = true;
+            paused_ = false;
+        }
         return transport_.StopAll();
     }
 
@@ -383,9 +495,11 @@ public:
             static_cast<unsigned long>(externalId),
             static_cast<unsigned long>(gain));
         if (!Matches(externalId) || gain > 10000) return E_INVALIDARG;
-        std::scoped_lock lock(stateMutex_);
-        globalGain_ = gain;
-        return RenderEverythingLocked(std::chrono::steady_clock::now());
+        {
+            std::scoped_lock lock(stateMutex_);
+            globalGain_ = gain;
+        }
+        return RenderEverything(std::chrono::steady_clock::now());
     }
 
     HRESULT STDMETHODCALLTYPE SendForceFeedbackCommand(DWORD externalId, DWORD command) override {
@@ -394,12 +508,13 @@ public:
             static_cast<unsigned long>(externalId),
             static_cast<unsigned long>(command));
         if (!Matches(externalId)) return E_INVALIDARG;
-        std::scoped_lock lock(stateMutex_);
+        std::unique_lock lock(stateMutex_);
         switch (command) {
         case DISFFC_RESET:
             effects_.clear();
             paused_ = false;
             lastRendered_ = 0;
+            lock.unlock();
             return transport_.StopAll();
         case DISFFC_STOPALL:
             for (auto& [_, effect] : effects_) {
@@ -408,20 +523,25 @@ public:
             }
             paused_ = false;
             lastRendered_ = 0;
+            lock.unlock();
             return transport_.StopAll();
         case DISFFC_PAUSE:
             paused_ = true;
             lastRendered_ = 0;
+            lock.unlock();
             return transport_.StopAll();
         case DISFFC_CONTINUE:
             paused_ = false;
-            return RenderEverythingLocked(std::chrono::steady_clock::now());
+            lock.unlock();
+            return RenderEverything(std::chrono::steady_clock::now());
         case DISFFC_SETACTUATORSON:
             actuatorsEnabled_ = true;
-            return RenderEverythingLocked(std::chrono::steady_clock::now());
+            lock.unlock();
+            return RenderEverything(std::chrono::steady_clock::now());
         case DISFFC_SETACTUATORSOFF:
             actuatorsEnabled_ = false;
             lastRendered_ = 0;
+            lock.unlock();
             return transport_.StopAll();
         default:
             return E_INVALIDARG;
@@ -434,13 +554,34 @@ public:
         if (!Matches(externalId) || state == nullptr || state->dwSize < sizeof(DIDEVICESTATE)) {
             return E_INVALIDARG;
         }
-        std::scoped_lock lock(stateMutex_);
         state->dwState = 0;
-        if (paused_) state->dwState |= DIGFFS_PAUSED;
-        if (actuatorsEnabled_) state->dwState |= DIGFFS_ACTUATORSON;
-        else state->dwState |= DIGFFS_ACTUATORSOFF;
-        state->dwState |= DIGFFS_POWERON | DIGFFS_SAFETYSWITCHOFF | DIGFFS_USERFFSWITCHON;
-        state->dwLoad = std::min<DWORD>(100, static_cast<DWORD>(effects_.size()) * 6);
+        bool paused = false;
+        bool actuatorsEnabled = false;
+        std::size_t effectCount = 0;
+        {
+            std::scoped_lock lock(stateMutex_);
+            paused = paused_;
+            actuatorsEnabled = actuatorsEnabled_;
+            effectCount = effects_.size();
+        }
+        if (paused) state->dwState |= DIGFFS_PAUSED;
+        const auto safetyMode = transport_.SafetyMode();
+        const auto safeAndConnected =
+            transport_.BrokerConnected() &&
+            (safetyMode == dfgt::ipc::SafetyMode::Armed ||
+             safetyMode == dfgt::ipc::SafetyMode::Active);
+        if (actuatorsEnabled && safeAndConnected) {
+            state->dwState |=
+                DIGFFS_ACTUATORSON | DIGFFS_POWERON |
+                DIGFFS_SAFETYSWITCHOFF |
+                DIGFFS_USERFFSWITCHON;
+        } else {
+            state->dwState |= DIGFFS_ACTUATORSOFF;
+        }
+        state->dwLoad = static_cast<DWORD>(
+            std::min<std::size_t>(
+                100,
+                effectCount * 100 / kMaximumEffects));
         return S_OK;
     }
 
@@ -449,16 +590,36 @@ public:
         DWORD effectId,
         DWORD* handle,
         const DIEFFECT* effect,
-        DWORD flags) override {
-        if (!Matches(externalId) || handle == nullptr || effect == nullptr) return E_INVALIDARG;
+        DWORD flags) override try {
+        if (!Matches(externalId) || handle == nullptr || effect == nullptr) {
+            return E_INVALIDARG;
+        }
+        if ((flags & ~kKnownDownloadFlags) != 0 ||
+            ((flags & DIEP_START) != 0 &&
+             (flags & DIEP_NODOWNLOAD) != 0)) {
+            return DIERR_INVALIDPARAM;
+        }
         LogDiagnostic(
             "DownloadEffect externalId=%lu effectId=%lu flags=%lu handle=%lu",
             static_cast<unsigned long>(externalId),
             static_cast<unsigned long>(effectId),
             static_cast<unsigned long>(flags),
             static_cast<unsigned long>(*handle));
-        EffectState candidate{};
-        const auto parseResult = ParseEffect(effectId, *effect, candidate);
+        const auto validateOnly = (flags & DIEP_NODOWNLOAD) != 0;
+        const auto requested = flags & kEffectParameterFlags;
+        std::unique_lock lock(stateMutex_);
+        const auto creating = *handle == kInvalidEffectHandle;
+        const auto existing = creating
+            ? effects_.end()
+            : effects_.find(*handle);
+        if (!creating && existing == effects_.end()) {
+            return DIERR_NOTDOWNLOADED;
+        }
+        EffectState candidate =
+            creating ? EffectState{} : existing->second;
+        const auto parseResult = ParseEffect(
+            effectId, *effect, candidate,
+            requested, creating || requested == 0);
         LogDiagnostic(
             "DownloadEffect parse=0x%08lX magnitude=%ld gain=%lu duration=%lu",
             static_cast<unsigned long>(parseResult),
@@ -466,48 +627,61 @@ public:
             static_cast<unsigned long>(candidate.gain),
             static_cast<unsigned long>(candidate.durationUs));
         if (FAILED(parseResult)) return parseResult;
-        if ((flags & DIEP_NODOWNLOAD) != 0) return S_OK;
-
-        std::scoped_lock lock(stateMutex_);
-        if (*handle == kInvalidEffectHandle) {
+        if (validateOnly) return S_OK;
+        if ((flags & DIEP_START) != 0 &&
+            HasPlayingSlotConflict(candidate, *handle)) {
+            return DIERR_DEVICEFULL;
+        }
+        DWORD committedHandle = *handle;
+        if (creating) {
             if (effects_.size() >= kMaximumEffects) return DIERR_DEVICEFULL;
             while (nextHandle_ == kInvalidEffectHandle ||
                    effects_.contains(nextHandle_)) {
                 ++nextHandle_;
             }
-            *handle = nextHandle_++;
-            effects_.emplace(*handle, EffectState{});
-        } else if (!effects_.contains(*handle)) {
-            return DIERR_NOTDOWNLOADED;
+            committedHandle = nextHandle_++;
+            effects_.emplace(committedHandle, candidate);
+            *handle = committedHandle;
+        } else {
+            existing->second = candidate;
         }
-        auto& stored = effects_.at(*handle);
-        candidate.playing = stored.playing;
-        candidate.hasDeadline = stored.hasDeadline;
-        candidate.startsAt = stored.startsAt;
-        candidate.deadline = stored.deadline;
-        candidate.conditionStarted = stored.conditionStarted;
-        stored = candidate;
+        auto& stored = effects_.at(committedHandle);
         if ((flags & DIEP_START) != 0) {
             stored.playing = true;
             ArmDeadline(stored, 1);
             timerWake_.notify_all();
-            return RenderEverythingLocked(std::chrono::steady_clock::now());
+            lock.unlock();
+            return RenderEverything(std::chrono::steady_clock::now());
         }
         if (stored.playing) {
-            return RenderEverythingLocked(std::chrono::steady_clock::now());
+            const auto noRestart = (flags & DIEP_NORESTART) != 0;
+            lock.unlock();
+            return noRestart
+                ? RenderCurrent(std::chrono::steady_clock::now())
+                : RenderEverything(std::chrono::steady_clock::now());
         }
         return S_OK;
+    } catch (const std::bad_alloc&) {
+        return E_OUTOFMEMORY;
+    } catch (const std::system_error& error) {
+        const auto value = error.code().value();
+        return value > 0
+            ? HRESULT_FROM_WIN32(static_cast<DWORD>(value))
+            : E_FAIL;
+    } catch (...) {
+        return E_FAIL;
     }
 
     HRESULT STDMETHODCALLTYPE DestroyEffect(DWORD externalId, DWORD handle) override {
         if (!Matches(externalId) || handle == kInvalidEffectHandle) return E_INVALIDARG;
-        std::scoped_lock lock(stateMutex_);
+        std::unique_lock lock(stateMutex_);
         const auto found = effects_.find(handle);
         if (found == effects_.end()) return DIERR_NOTDOWNLOADED;
         const bool wasPlaying = found->second.playing;
         effects_.erase(found);
+        lock.unlock();
         return wasPlaying
-            ? RenderEverythingLocked(std::chrono::steady_clock::now())
+            ? RenderEverything(std::chrono::steady_clock::now())
             : S_OK;
     }
 
@@ -523,14 +697,27 @@ public:
             static_cast<unsigned long>(mode),
             static_cast<unsigned long>(iterations));
         if (!Matches(externalId)) return E_INVALIDARG;
-        std::scoped_lock lock(stateMutex_);
+        if ((mode & ~DIES_SOLO) != 0) return DIERR_INVALIDPARAM;
+        std::unique_lock lock(stateMutex_);
         const auto found = effects_.find(handle);
         if (found == effects_.end()) return DIERR_NOTDOWNLOADED;
-        if (iterations == 0) return E_INVALIDARG;
+        if (iterations == 0) return DIERR_INVALIDPARAM;
+        if ((mode & DIES_SOLO) != 0) {
+            for (auto& [otherHandle, effect] : effects_) {
+                if (otherHandle == handle) continue;
+                effect.playing = false;
+                effect.hasDeadline = false;
+                effect.conditionStarted = false;
+            }
+        } else if (HasPlayingSlotConflict(
+                       found->second, handle)) {
+            return DIERR_DEVICEFULL;
+        }
         found->second.playing = true;
         ArmDeadline(found->second, iterations);
         timerWake_.notify_all();
-        return RenderEverythingLocked(std::chrono::steady_clock::now());
+        lock.unlock();
+        return RenderEverything(std::chrono::steady_clock::now());
     }
 
     HRESULT STDMETHODCALLTYPE StopEffect(DWORD externalId, DWORD handle) override {
@@ -539,13 +726,14 @@ public:
             static_cast<unsigned long>(externalId),
             static_cast<unsigned long>(handle));
         if (!Matches(externalId)) return E_INVALIDARG;
-        std::scoped_lock lock(stateMutex_);
+        std::unique_lock lock(stateMutex_);
         const auto found = effects_.find(handle);
         if (found == effects_.end()) return DIERR_NOTDOWNLOADED;
         found->second.playing = false;
         found->second.hasDeadline = false;
         found->second.conditionStarted = false;
-        return RenderEverythingLocked(std::chrono::steady_clock::now());
+        lock.unlock();
+        return RenderEverything(std::chrono::steady_clock::now());
     }
 
     HRESULT STDMETHODCALLTYPE GetEffectStatus(
@@ -563,25 +751,100 @@ public:
     }
 
 private:
+    static int NativeConditionSlot(EffectKind kind) noexcept {
+        if (kind == EffectKind::Spring) return 1;
+        if (kind == EffectKind::Damper ||
+            kind == EffectKind::Inertia) return 2;
+        if (kind == EffectKind::Friction) return 3;
+        return 0;
+    }
+
+    bool HasPlayingSlotConflict(
+        const EffectState& candidate,
+        DWORD candidateHandle) const noexcept {
+        const auto slot = NativeConditionSlot(candidate.kind);
+        if (slot == 0) return false;
+        return std::ranges::any_of(
+            effects_,
+            [&](const auto& item) {
+                return item.first != candidateHandle &&
+                    item.second.playing &&
+                    NativeConditionSlot(item.second.kind) == slot;
+            });
+    }
+
     static HRESULT ParseEffect(
         DWORD effectId,
         const DIEFFECT& source,
-        EffectState& target) noexcept {
-        if (source.dwSize < sizeof(DIEFFECT) ||
-            source.dwGain > 10000 ||
-            source.lpvTypeSpecificParams == nullptr ||
-            source.cAxes != 1 ||
-            source.rgdwAxes == nullptr ||
-            source.rglDirection == nullptr ||
-            (source.dwFlags & DIEFF_CARTESIAN) == 0) {
+        EffectState& target,
+        DWORD requested,
+        bool full) {
+        if (source.dwSize < sizeof(DIEFFECT)) {
             return DIERR_INVALIDPARAM;
         }
 
-        target.gain = source.dwGain;
-        target.durationUs = source.dwDuration;
-        target.startDelayUs = source.dwStartDelay;
-        target.direction = source.rglDirection[0] < 0 ? -1 : 1;
-        if (source.lpEnvelope != nullptr) {
+        if (full || (requested & DIEP_GAIN) != 0) {
+            if (source.dwGain > 10000) return DIERR_INVALIDPARAM;
+            target.gain = source.dwGain;
+        }
+        if (full || (requested & DIEP_DURATION) != 0) {
+            target.durationUs = source.dwDuration;
+        }
+        if (full || (requested & DIEP_STARTDELAY) != 0) {
+            target.startDelayUs = source.dwStartDelay;
+        }
+        if (full || (requested & DIEP_SAMPLEPERIOD) != 0) {
+            if (source.dwSamplePeriod != 0 &&
+                source.dwSamplePeriod < kMinimumEffectPeriodUs) {
+                return DIERR_INVALIDPARAM;
+            }
+        }
+        if (full || (requested &
+                (DIEP_TRIGGERBUTTON |
+                 DIEP_TRIGGERREPEATINTERVAL)) != 0) {
+            if (source.dwTriggerButton != DIEB_NOTRIGGER ||
+                source.dwTriggerRepeatInterval != 0) {
+                return DIERR_UNSUPPORTED;
+            }
+        }
+        if (full || (requested & DIEP_AXES) != 0) {
+            if (source.cAxes != 1 || source.rgdwAxes == nullptr) {
+                return DIERR_INVALIDPARAM;
+            }
+            const auto objectMode =
+                source.dwFlags & (DIEFF_OBJECTIDS | DIEFF_OBJECTOFFSETS);
+            const auto coordinateMode =
+                source.dwFlags &
+                (DIEFF_CARTESIAN | DIEFF_POLAR | DIEFF_SPHERICAL);
+            if (coordinateMode != DIEFF_CARTESIAN ||
+                (objectMode != DIEFF_OBJECTIDS &&
+                 objectMode != DIEFF_OBJECTOFFSETS)) {
+                return DIERR_INVALIDPARAM;
+            }
+            const auto axisValid =
+                objectMode == DIEFF_OBJECTOFFSETS
+                ? source.rgdwAxes[0] == DIJOFS_X
+                : DIDFT_GETTYPE(source.rgdwAxes[0]) == DIDFT_ABSAXIS &&
+                    DIDFT_GETINSTANCE(source.rgdwAxes[0]) == 0;
+            if (!axisValid) return DIERR_INVALIDPARAM;
+        }
+        if (full || (requested & DIEP_DIRECTION) != 0) {
+            if (source.cAxes != 1 ||
+                source.rglDirection == nullptr ||
+                source.rglDirection[0] == 0 ||
+                source.rglDirection[0] < -10000 ||
+                source.rglDirection[0] > 10000 ||
+                (source.dwFlags & DIEFF_CARTESIAN) == 0) {
+                return DIERR_INVALIDPARAM;
+            }
+            target.direction =
+                source.rglDirection[0] < 0 ? -1 : 1;
+        }
+        if (full || (requested & DIEP_ENVELOPE) != 0) {
+            target.hasEnvelope = source.lpEnvelope != nullptr;
+            if (source.lpEnvelope == nullptr) {
+                target.envelope = {};
+            } else {
             if (source.lpEnvelope->dwSize < sizeof(DIENVELOPE) ||
                 source.lpEnvelope->dwAttackLevel > 10000 ||
                 source.lpEnvelope->dwFadeLevel > 10000) {
@@ -589,8 +852,15 @@ private:
             }
             target.envelope = *source.lpEnvelope;
             target.hasEnvelope = true;
+            }
         }
 
+        const auto updateTypeSpecific =
+            full || (requested & DIEP_TYPESPECIFICPARAMS) != 0;
+        if (!updateTypeSpecific) return S_OK;
+        if (source.lpvTypeSpecificParams == nullptr) {
+            return DIERR_INVALIDPARAM;
+        }
         switch (effectId) {
         case kConstantEffectId: {
             if (source.cbTypeSpecificParams != sizeof(DICONSTANTFORCE)) {
@@ -634,7 +904,7 @@ private:
                 parameters.lOffset < -10000 ||
                 parameters.lOffset > 10000 ||
                 parameters.dwPhase >= 36000 ||
-                parameters.dwPeriod == 0) {
+                parameters.dwPeriod < kMinimumEffectPeriodUs) {
                 return DIERR_INVALIDPARAM;
             }
             target.kind = effectId == kSquareEffectId ? EffectKind::Square
@@ -683,7 +953,7 @@ private:
                 *static_cast<const DICUSTOMFORCE*>(source.lpvTypeSpecificParams);
             constexpr DWORD kMaximumCustomSamples = 4096;
             if (parameters.cChannels != 1 ||
-                parameters.dwSamplePeriod == 0 ||
+                parameters.dwSamplePeriod < kMinimumEffectPeriodUs ||
                 (source.dwSamplePeriod != 0 &&
                  source.dwSamplePeriod != parameters.dwSamplePeriod) ||
                 parameters.cSamples == 0 ||
@@ -809,7 +1079,11 @@ private:
             10000);
     }
 
-    HRESULT RenderAllLocked(std::chrono::steady_clock::time_point now) noexcept {
+    HRESULT RenderAll(std::chrono::steady_clock::time_point now) noexcept {
+        std::int32_t rendered = 0;
+        std::int32_t periodicRendered = 0;
+        {
+        std::scoped_lock lock(stateMutex_);
         if (paused_ || !actuatorsEnabled_) return S_OK;
         std::int64_t sum = 0;
         std::int64_t periodicSum = 0;
@@ -834,11 +1108,12 @@ private:
             periodicSum * globalGain_ / 10000,
             -10000,
             10000);
-        const auto rendered = static_cast<std::int32_t>(scaled);
-        const auto periodicRendered =
+        rendered = static_cast<std::int32_t>(scaled);
+        periodicRendered =
             static_cast<std::int32_t>(periodicScaled);
         if (rendered == lastRendered_ &&
             periodicRendered == lastPeriodicRendered_) return S_OK;
+        }
         const auto result =
             transport_.Constant(rendered, periodicRendered);
         LogDiagnostic(
@@ -847,16 +1122,31 @@ private:
             static_cast<long>(periodicRendered),
             static_cast<unsigned long>(result));
         if (SUCCEEDED(result)) {
+            std::scoped_lock lock(stateMutex_);
             lastRendered_ = rendered;
             lastPeriodicRendered_ = periodicRendered;
         }
         return result;
     }
 
-    HRESULT RenderConditionsLocked(
+    struct ConditionRender final {
+        DWORD handle{};
+        dfgt::ipc::Command command{};
+        LONG negativeCoefficient{};
+        LONG positiveCoefficient{};
+        LONG offset{};
+        DWORD deadBand{};
+        DWORD negativeSaturation{};
+        DWORD positiveSaturation{};
+    };
+
+    HRESULT RenderConditions(
         std::chrono::steady_clock::time_point now) noexcept {
+        std::vector<ConditionRender> renders;
+        {
+        std::scoped_lock lock(stateMutex_);
         if (paused_ || !actuatorsEnabled_) return S_OK;
-        for (auto& [_, effect] : effects_) {
+        for (const auto& [handle, effect] : effects_) {
             if (!effect.playing || now < effect.startsAt) continue;
             dfgt::ipc::Command command{};
             if (effect.kind == EffectKind::Spring) command = dfgt::ipc::Command::Spring;
@@ -888,59 +1178,95 @@ private:
                     0,
                     10000));
             };
-            const auto result = transport_.Condition(
+            renders.push_back(ConditionRender{
+                handle,
                 command,
                 scaleSigned(effect.condition.lNegativeCoefficient),
                 scaleSigned(effect.condition.lPositiveCoefficient),
                 effect.condition.lOffset,
                 static_cast<DWORD>(effect.condition.lDeadBand),
                 scaleUnsigned(effect.condition.dwNegativeSaturation),
-                scaleUnsigned(effect.condition.dwPositiveSaturation));
+                scaleUnsigned(effect.condition.dwPositiveSaturation)});
+        }
+        }
+        for (const auto& render : renders) {
+            const auto result = transport_.Condition(
+                render.command,
+                render.negativeCoefficient,
+                render.positiveCoefficient,
+                render.offset,
+                render.deadBand,
+                render.negativeSaturation,
+                render.positiveSaturation);
             if (FAILED(result)) return result;
-            effect.conditionStarted = true;
+            std::scoped_lock lock(stateMutex_);
+            const auto effect = effects_.find(render.handle);
+            if (effect != effects_.end() && effect->second.playing)
+                effect->second.conditionStarted = true;
         }
         return S_OK;
     }
 
-    HRESULT RenderEverythingLocked(
+    HRESULT RenderCurrent(
         std::chrono::steady_clock::time_point now) noexcept {
-        const auto stopResult = transport_.StopAll();
-        lastRendered_ = 0;
-        lastPeriodicRendered_ = 0;
-        if (FAILED(stopResult)) return stopResult;
-        for (auto& [_, effect] : effects_) effect.conditionStarted = false;
-        const auto softwareResult = RenderAllLocked(now);
+        std::scoped_lock renderLock(renderMutex_);
+        const auto softwareResult = RenderAll(now);
         if (FAILED(softwareResult)) return softwareResult;
-        return RenderConditionsLocked(now);
+        return RenderConditions(now);
+    }
+
+    HRESULT RenderEverything(
+        std::chrono::steady_clock::time_point now) noexcept {
+        std::scoped_lock renderLock(renderMutex_);
+        const auto stopResult = transport_.StopAll();
+        {
+            std::scoped_lock lock(stateMutex_);
+            lastRendered_ = 0;
+            lastPeriodicRendered_ = 0;
+            for (auto& [_, effect] : effects_)
+                effect.conditionStarted = false;
+        }
+        if (FAILED(stopResult)) return stopResult;
+        const auto softwareResult = RenderAll(now);
+        if (FAILED(softwareResult)) return softwareResult;
+        return RenderConditions(now);
     }
 
     static void ArmDeadline(EffectState& effect, DWORD iterations) noexcept {
         effect.startsAt = std::chrono::steady_clock::now() +
             std::chrono::microseconds(effect.startDelayUs);
         effect.conditionStarted = false;
-        effect.hasDeadline = effect.durationUs != INFINITE;
-        if (!effect.hasDeadline) return;
-        const auto boundedIterations = iterations == INFINITE
-            ? static_cast<std::uint64_t>(UINT32_MAX)
-            : static_cast<std::uint64_t>(iterations);
-        const auto totalUs = std::min<std::uint64_t>(
-            static_cast<std::uint64_t>(effect.durationUs) * boundedIterations,
-            static_cast<std::uint64_t>(std::chrono::microseconds::max().count()));
-        effect.deadline = effect.startsAt +
-            std::chrono::microseconds(totalUs);
+        const auto deadline = dfgt::timing::Deadline(
+            effect.startsAt, effect.durationUs, iterations);
+        effect.hasDeadline = deadline.has_value();
+        if (deadline) effect.deadline = *deadline;
     }
 
     void TimerLoop(std::stop_token stop) noexcept {
-        std::mutex waitMutex;
-        std::unique_lock waitLock(waitMutex);
+        auto timer = CreateWaitableTimerExW(
+            nullptr,
+            nullptr,
+            CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+            TIMER_ALL_ACCESS);
+        if (timer == nullptr) {
+            timer = CreateWaitableTimerW(nullptr, FALSE, nullptr);
+        }
+        LARGE_INTEGER due{};
+        due.QuadPart = -20000; // Relative 2 ms in 100 ns units.
+        const auto timerReady = timer != nullptr &&
+            SetWaitableTimer(timer, &due, 2, nullptr, nullptr, FALSE);
         while (!stop.stop_requested()) {
-            timerWake_.wait_for(waitLock, std::chrono::milliseconds(2));
+            if (timerReady) {
+                WaitForSingleObject(timer, 10);
+            } else {
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
             if (stop.stop_requested()) break;
 
+            bool rerenderConditions = false;
             {
                 std::scoped_lock lock(stateMutex_);
                 const auto now = std::chrono::steady_clock::now();
-                bool rerenderConditions = false;
                 for (auto& [_, effect] : effects_) {
                     if (!effect.playing) continue;
                     if (effect.hasDeadline && now >= effect.deadline) {
@@ -961,15 +1287,23 @@ private:
                         rerenderConditions = true;
                     }
                 }
-                if (rerenderConditions) RenderEverythingLocked(now);
-                else RenderAllLocked(now);
             }
+            const auto now = std::chrono::steady_clock::now();
+            if (rerenderConditions) RenderEverything(now);
+            else RenderCurrent(now);
+            const auto epoch = ++renderEpoch_;
+            transport_.UpdateRenderEpoch(epoch);
+        }
+        if (timer != nullptr) {
+            CancelWaitableTimer(timer);
+            CloseHandle(timer);
         }
     }
 
     std::atomic<long> references_{1};
     BrokerTransport transport_;
     std::mutex stateMutex_;
+    std::mutex renderMutex_;
     std::unordered_map<DWORD, EffectState> effects_;
     std::atomic<DWORD> externalId_{};
     DWORD nextHandle_{kFirstEffectHandle};
@@ -978,6 +1312,7 @@ private:
     bool paused_{};
     std::int32_t lastRendered_{};
     std::int32_t lastPeriodicRendered_{};
+    std::uint64_t renderEpoch_{};
     std::condition_variable timerWake_;
     std::jthread timer_;
 };
@@ -1029,10 +1364,11 @@ private:
 
 } // namespace
 
+_Check_return_
 STDAPI DllGetClassObject(
-    REFCLSID clsid,
-    REFIID iid,
-    void** object) {
+    _In_ REFCLSID clsid,
+    _In_ REFIID iid,
+    _Outptr_ LPVOID FAR* object) {
     if (!IsEqualCLSID(clsid, CLSID_DfgtDirectInputFfb)) return CLASS_E_CLASSNOTAVAILABLE;
     auto* factory = new (std::nothrow) ClassFactory();
     if (factory == nullptr) return E_OUTOFMEMORY;
@@ -1041,6 +1377,7 @@ STDAPI DllGetClassObject(
     return result;
 }
 
+__control_entrypoint(DllExport)
 STDAPI DllCanUnloadNow() {
     return g_objects == 0 && g_locks == 0 ? S_OK : S_FALSE;
 }

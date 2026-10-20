@@ -1,7 +1,6 @@
 [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
 param(
-    [string]$InstallRoot = (Join-Path $env:ProgramFiles 'DfgtControl'),
-    [string[]]$RestoreRegistryBackup
+    [string]$InstallRoot = (Join-Path $env:ProgramFiles 'DfgtControl')
 )
 
 $ErrorActionPreference = 'Stop'
@@ -15,10 +14,8 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 
 $clsid = '{806A045D-E7E8-491E-A607-31495A7BF4A3}'
 $ffRoot = 'HKLM:\SYSTEM\CurrentControlSet\Control\MediaProperties\PrivateProperties\Joystick\OEM\VID_046D&PID_C29A\OEMForceFeedback'
-$userFfRoot = 'HKCU:\SYSTEM\CurrentControlSet\Control\MediaProperties\PrivateProperties\Joystick\OEM\VID_046D&PID_C29A\OEMForceFeedback'
 $class64 = "HKLM:\SOFTWARE\Classes\CLSID\$clsid"
 $class32 = "HKLM:\SOFTWARE\Classes\WOW6432Node\CLSID\$clsid"
-$runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $runNames = @('DfgtFfbBroker', 'DfgtControlAgent')
 $manifestPath = Join-Path $InstallRoot 'install-manifest.json'
 
@@ -29,9 +26,29 @@ $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
 $resolvedInstallRoot = [IO.Path]::GetFullPath($InstallRoot).TrimEnd('\')
 $manifestRoot = [IO.Path]::GetFullPath([string]$manifest.installRoot).TrimEnd('\')
 if ($resolvedInstallRoot -ne $manifestRoot -or
-    [IO.Path]::GetFileName($resolvedInstallRoot) -ne 'DfgtControl') {
+    -not [IO.Path]::GetFileName($resolvedInstallRoot) -or
+    $resolvedInstallRoot -in @(
+        [IO.Path]::GetPathRoot($resolvedInstallRoot).TrimEnd('\'),
+        [IO.Path]::GetFullPath($env:ProgramFiles).TrimEnd('\'),
+        [IO.Path]::GetFullPath($env:ProgramData).TrimEnd('\'),
+        [IO.Path]::GetFullPath($env:WINDIR).TrimEnd('\'),
+        [IO.Path]::GetFullPath(
+            [Environment]::GetFolderPath('UserProfile')).TrimEnd('\'))) {
     throw "Refusing cleanup of an unexpected install root: $resolvedInstallRoot"
 }
+if ([string]$manifest.targetUserSid -notmatch
+        '^S-1-5-21-(?:[0-9]+-){3}[0-9]+$') {
+    throw 'Install manifest has no valid target user SID.'
+}
+$targetUserSid = [string]$manifest.targetUserSid
+$targetUserProfile = [IO.Path]::GetFullPath(
+    [string]$manifest.targetUserProfile).TrimEnd('\')
+$userHive = "Registry::HKEY_USERS\$targetUserSid"
+if (-not (Test-Path -LiteralPath $userHive)) {
+    throw "Target user hive is not loaded: $targetUserSid"
+}
+$userFfRoot = "$userHive\SYSTEM\CurrentControlSet\Control\MediaProperties\PrivateProperties\Joystick\OEM\VID_046D&PID_C29A\OEMForceFeedback"
+$runKey = "$userHive\Software\Microsoft\Windows\CurrentVersion\Run"
 
 $ownedFiles = @(
     foreach ($file in $manifest.files) {
@@ -55,22 +72,6 @@ if ($unexpectedFiles) {
     throw "Refusing recursive cleanup because unowned files exist: $($unexpectedFiles.FullName -join ', ')"
 }
 
-if ($RestoreRegistryBackup) {
-    $resolvedBackups = @(
-        foreach ($registryBackup in $RestoreRegistryBackup) {
-            $resolvedBackup = [IO.Path]::GetFullPath($registryBackup)
-            if (-not (Test-Path -LiteralPath $resolvedBackup -PathType Leaf) -or
-                [IO.Path]::GetExtension($resolvedBackup) -ne '.reg') {
-                throw "Registry backup is missing or is not a .reg file: $resolvedBackup"
-            }
-            $resolvedBackup
-        }
-    )
-}
-else {
-    $resolvedBackups = @()
-}
-
 function Remove-OwnedForceFeedbackRoot {
     param([Parameter(Mandatory)][string]$Path)
 
@@ -88,6 +89,69 @@ function Remove-OwnedForceFeedbackRoot {
 }
 
 if ($PSCmdlet.ShouldProcess($resolvedInstallRoot, 'Remove DFGT user-mode FFB stack')) {
+    $presentDfgt = try {
+        @(
+            Get-PnpDevice -PresentOnly -ErrorAction Stop |
+                Where-Object InstanceId -like '*VID_046D&PID_C29A*'
+        )
+    }
+    catch {
+        throw "Could not prove DFGT disconnection: $($_.Exception.Message)"
+    }
+    if ($presentDfgt) {
+        throw 'Disconnect the DFGT before uninstall. No process or registration has been changed.'
+    }
+    $restartManager = Join-Path $resolvedInstallRoot `
+        'bin\x64\DfgtRestartManagerCheck.exe'
+    if (-not (Test-Path -LiteralPath $restartManager -PathType Leaf)) {
+        throw 'Owned Restart Manager checker is missing; uninstall aborted.'
+    }
+    & $restartManager `
+        (Join-Path $resolvedInstallRoot 'bin\x64\DfgtDirectInputFfb.dll') `
+        (Join-Path $resolvedInstallRoot 'bin\x86\DfgtDirectInputFfb.dll')
+    if ($LASTEXITCODE -eq 10) {
+        throw 'Restart Manager found a game using the DirectInput provider. Close it before uninstall.'
+    }
+    if ($LASTEXITCODE -ne 0) {
+        throw "Restart Manager inspection failed with exit code $LASTEXITCODE."
+    }
+    $maintenanceTool = Join-Path $resolvedInstallRoot `
+        'bin\x64\DfgtMaintenance.exe'
+    $agentProcess = Get-CimInstance Win32_Process |
+        Where-Object {
+            $_.Name -eq 'DfgtAgent.exe' -and
+            $_.ExecutablePath -and
+            [IO.Path]::GetFullPath($_.ExecutablePath).StartsWith(
+                "$resolvedInstallRoot\",
+                [StringComparison]::OrdinalIgnoreCase)
+        }
+    if ($agentProcess -and
+        (Test-Path -LiteralPath $maintenanceTool -PathType Leaf)) {
+        & $maintenanceTool | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            $statusTool = Join-Path $resolvedInstallRoot `
+                'bin\x64\DfgtBrokerStatusSmoke.exe'
+            $statusOutput = if (Test-Path -LiteralPath $statusTool `
+                    -PathType Leaf) {
+                & $statusTool 2>$null | Out-String
+            }
+            else { $null }
+            $status = try {
+                $statusOutput | ConvertFrom-Json
+            }
+            catch { $null }
+            $deviceNotConnected = -2147023729
+            $safeAbsentState =
+                $null -ne $status -and
+                $status.ffbClientConnected -eq 0 -and
+                $status.activeSlots -eq 0 -and
+                ($status.connected -eq 0 -or
+                 $status.lastSafetyError -eq $deviceNotConnected)
+            if (-not $safeAbsentState) {
+                throw 'PrepareForMaintenance was not confirmed. Close games and retry while disconnected.'
+            }
+        }
+    }
     Get-CimInstance Win32_Process |
         Where-Object {
             $_.Name -in @('DfgtFfbBroker.exe', 'DfgtAgent.exe', 'DfgtControl.exe') -and
@@ -100,26 +164,40 @@ if ($PSCmdlet.ShouldProcess($resolvedInstallRoot, 'Remove DFGT user-mode FFB sta
 
     if (Test-Path -LiteralPath $runKey) {
         foreach ($runName in $runNames) {
-            Remove-ItemProperty -LiteralPath $runKey -Name $runName `
-                -ErrorAction SilentlyContinue
+            $runProperties = Get-ItemProperty -LiteralPath $runKey `
+                -Name $runName -ErrorAction SilentlyContinue
+            $runValue = if ($runProperties -and
+                $runProperties.PSObject.Properties[$runName]) {
+                $runProperties.$runName
+            }
+            else { $null }
+            if ($runValue) {
+                $candidate = ([string]$runValue).Trim().Trim('"')
+                if ([IO.Path]::GetFullPath($candidate).StartsWith(
+                        "$resolvedInstallRoot\",
+                        [StringComparison]::OrdinalIgnoreCase)) {
+                    Remove-ItemProperty -LiteralPath $runKey -Name $runName
+                }
+            }
         }
     }
-    $shortcutPath = Join-Path `
-        ([Environment]::GetFolderPath('Programs')) 'DFGT Control.lnk'
-    Remove-Item -LiteralPath $shortcutPath -Force -ErrorAction SilentlyContinue
+    $shortcutPath = Join-Path $targetUserProfile `
+        'AppData\Roaming\Microsoft\Windows\Start Menu\Programs\DFGT Control.lnk'
+    if (Test-Path -LiteralPath $shortcutPath -PathType Leaf) {
+        $shell = New-Object -ComObject WScript.Shell
+        $shortcut = $shell.CreateShortcut($shortcutPath)
+        if ([IO.Path]::GetFullPath($shortcut.TargetPath) -eq
+            [IO.Path]::GetFullPath(
+                (Join-Path $resolvedInstallRoot 'bin\x64\DfgtControl.exe'))) {
+            Remove-Item -LiteralPath $shortcutPath -Force
+        }
+    }
 
     Remove-OwnedForceFeedbackRoot -Path $ffRoot
     Remove-OwnedForceFeedbackRoot -Path $userFfRoot
     foreach ($class in @($class64, $class32)) {
         if (Test-Path -LiteralPath $class) {
             Remove-Item -LiteralPath $class -Recurse -Force
-        }
-    }
-
-    foreach ($resolvedBackup in $resolvedBackups) {
-        & reg.exe import $resolvedBackup | Out-Null
-        if ($LASTEXITCODE -ne 0) {
-            throw "Registry backup import failed: $resolvedBackup"
         }
     }
 
@@ -142,5 +220,6 @@ if ($PSCmdlet.ShouldProcess($resolvedInstallRoot, 'Remove DFGT user-mode FFB sta
 [pscustomobject]@{
     removed = -not [bool]$WhatIfPreference
     installRoot = $resolvedInstallRoot
-    restoredRegistryBackups = $resolvedBackups.Count
+    restoredRegistryBackups = 0
+    legacyRestore = 'Use Restore-LogitechLegacyStack.ps1 with a verified schema 3 project snapshot.'
 } | ConvertTo-Json

@@ -31,7 +31,9 @@ USB VID_046D&PID_C29A
 ```
 
 Other wheels are not supported yet, even if they use similar Logitech
-protocols.
+protocols. A DFGT may initially appear as compatibility PID `C294`; the agent
+accepts only the DFGT `0x13xx` revision, switches it to `C29A`, and starts the
+broker only after native re-enumeration.
 
 ## Install
 
@@ -54,7 +56,11 @@ protocols.
 6. Install DFGT Control:
 
    ```powershell
-   .\scripts\Install-DfgtFfb.ps1 -Confirm:$false
+   .\scripts\Install-DfgtFfb.ps1 `
+     -ExpectedVersion '0.1.0-beta.1' `
+     -TargetUserSid ([Security.Principal.WindowsIdentity]::GetCurrent().User.Value) `
+     -TargetUserProfile ([Environment]::GetFolderPath('UserProfile')) `
+     -Confirm:$false
    ```
 
 7. Follow [the migration guide](docs/MIGRATION.md) before removing Logitech

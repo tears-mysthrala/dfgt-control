@@ -1,6 +1,13 @@
 #include "ControlClient.h"
+#include "../shared/BoundedIo.h"
+#include "../shared/WireCodec.h"
+#include "../shared/PipePeerValidation.h"
 
 namespace dfgt::agent {
+
+namespace {
+constexpr DWORD kControlIoTimeoutMs = 500;
+}
 
 ControlClient::~ControlClient() {
     Close();
@@ -17,10 +24,17 @@ HRESULT ControlClient::Connect() noexcept {
         0,
         nullptr,
         OPEN_EXISTING,
-        0,
+        FILE_FLAG_OVERLAPPED,
         nullptr);
     if (pipe_ == INVALID_HANDLE_VALUE) {
         return HRESULT_FROM_WIN32(GetLastError());
+    }
+    if (!dfgt::ipc::ValidatePipeServer(
+            pipe_,
+            GetModuleHandleW(nullptr),
+            L"DfgtFfbBroker.exe")) {
+        Close();
+        return E_ACCESSDENIED;
     }
     DWORD mode = PIPE_READMODE_MESSAGE;
     if (!SetNamedPipeHandleState(pipe_, &mode, nullptr, nullptr)) {
@@ -29,13 +43,18 @@ HRESULT ControlClient::Connect() noexcept {
         return result;
     }
     sequence_ = 0;
-    return S_OK;
+    sessionNonce_ = 0;
+    dfgt::ipc::control::Request request{};
+    dfgt::ipc::control::Response response{};
+    request.command = dfgt::ipc::control::Command::Ping;
+    return Exchange(request, response);
 }
 
 void ControlClient::Close() noexcept {
     if (pipe_ == INVALID_HANDLE_VALUE) return;
     CloseHandle(pipe_);
     pipe_ = INVALID_HANDLE_VALUE;
+    sessionNonce_ = 0;
 }
 
 bool ControlClient::Connected() const noexcept {
@@ -79,11 +98,27 @@ HRESULT ControlClient::EmergencyStop() noexcept {
     return Exchange(request, response);
 }
 
+HRESULT ControlClient::AcknowledgeAndRearm() noexcept {
+    dfgt::ipc::control::Request request{};
+    dfgt::ipc::control::Response response{};
+    request.command =
+        dfgt::ipc::control::Command::AcknowledgeAndRearm;
+    return Exchange(request, response);
+}
+
 HRESULT ControlClient::DetachDevice() noexcept {
     dfgt::ipc::control::Request request{};
     dfgt::ipc::control::Response response{};
     request.command =
         dfgt::ipc::control::Command::DetachDevice;
+    return Exchange(request, response);
+}
+
+HRESULT ControlClient::PrepareForMaintenance() noexcept {
+    dfgt::ipc::control::Request request{};
+    dfgt::ipc::control::Response response{};
+    request.command =
+        dfgt::ipc::control::Command::PrepareForMaintenance;
     return Exchange(request, response);
 }
 
@@ -105,36 +140,47 @@ HRESULT ControlClient::Exchange(
         return HRESULT_FROM_WIN32(ERROR_PIPE_NOT_CONNECTED);
     }
     request.sequence = ++sequence_;
-    DWORD written = 0;
-    if (!WriteFile(
-            pipe_,
-            &request,
-            sizeof(request),
-            &written,
-            nullptr) ||
-        written != sizeof(request)) {
-        const auto result = HRESULT_FROM_WIN32(GetLastError());
+    request.capabilities = dfgt::ipc::RequiredCapabilities;
+    request.sessionNonce = sessionNonce_;
+    request.buildId = dfgt::ipc::BuildId;
+    const auto encoded =
+        dfgt::ipc::control::wire::Encode(request);
+    const auto write = dfgt::io::WriteExact(
+        pipe_, encoded.data(),
+        static_cast<DWORD>(encoded.size()),
+        kControlIoTimeoutMs);
+    if (!write.Succeeded(
+            static_cast<DWORD>(encoded.size()))) {
+        const auto result = write.result;
         Close();
         return result;
     }
-    DWORD read = 0;
-    if (!ReadFile(
-            pipe_,
-            &response,
-            sizeof(response),
-            &read,
-            nullptr) ||
-        read != sizeof(response)) {
-        const auto result = HRESULT_FROM_WIN32(GetLastError());
+    dfgt::ipc::control::wire::EncodedResponse encodedResponse{};
+    const auto read = dfgt::io::ReadExact(
+        pipe_, encodedResponse.data(),
+        static_cast<DWORD>(encodedResponse.size()),
+        kControlIoTimeoutMs);
+    if (!read.Succeeded(
+            static_cast<DWORD>(encodedResponse.size()))) {
+        const auto result = read.result;
         Close();
         return result;
     }
-    if (response.magic != dfgt::ipc::control::Magic ||
-        response.version != dfgt::ipc::control::Version ||
-        response.size != sizeof(response) ||
+    if (!dfgt::ipc::control::wire::Decode(
+            encodedResponse, response) ||
         response.sequence != request.sequence) {
         Close();
         return E_INVALIDARG;
+    }
+    if (sessionNonce_ == 0) {
+        if (response.sessionNonce == 0) {
+            Close();
+            return E_ACCESSDENIED;
+        }
+        sessionNonce_ = response.sessionNonce;
+    } else if (response.sessionNonce != sessionNonce_) {
+        Close();
+        return E_ACCESSDENIED;
     }
     return response.result;
 }

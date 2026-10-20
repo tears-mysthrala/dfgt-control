@@ -2,6 +2,7 @@
 #include <hidsdi.h>
 #include <hidpi.h>
 #include <sddl.h>
+#include <bcrypt.h>
 
 #include <algorithm>
 #include <array>
@@ -9,6 +10,7 @@
 #include <cmath>
 #include <cstdint>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -16,17 +18,27 @@
 
 #include "../shared/BrokerProtocol.h"
 #include "../shared/DfgtReports.h"
+#include "../shared/BoundedIo.h"
+#include "../shared/WireCodec.h"
+#include "SafetyState.h"
+#include "EffectCoordinator.h"
+#include "LeaseWatchdog.h"
+#include "ClientProcessWatch.h"
+#include "EmergencyIoGate.h"
+#include "StopRecoveryPolicy.h"
 
 namespace {
 
 constexpr DWORD kReadTimeoutMs = 350;
+constexpr DWORD kHidWriteTimeoutMs = 75;
+constexpr DWORD kPipeIoTimeoutMs = 250;
 constexpr std::uint32_t kRangeLockEngageLow = 256;
 constexpr std::uint32_t kRangeLockReleaseLow = 1024;
 constexpr std::uint32_t kRangeLockEngageHigh = 16127;
 constexpr std::uint32_t kRangeLockReleaseHigh = 15359;
 constexpr std::int32_t kRangeLockMagnitude = 3000;
 
-class HidDevice final {
+class HidDevice final : public dfgt::broker::IEffectDevice {
 public:
     ~HidDevice() { Close(); }
 
@@ -39,7 +51,7 @@ public:
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             nullptr,
             OPEN_EXISTING,
-            0,
+            FILE_FLAG_OVERLAPPED,
             nullptr);
         if (handle_ == INVALID_HANDLE_VALUE) return HRESULT_FROM_WIN32(GetLastError());
 
@@ -59,7 +71,7 @@ public:
         readEvent_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
         if (readEvent_ == nullptr) {
             const auto result = HRESULT_FROM_WIN32(GetLastError());
-            Close();
+            CloseHandlesOnly();
             return result;
         }
         readHandle_ = CreateFileW(
@@ -72,12 +84,12 @@ public:
             nullptr);
         if (readHandle_ == INVALID_HANDLE_VALUE) {
             const auto result = HRESULT_FROM_WIN32(GetLastError());
-            Close();
+            CloseHandlesOnly();
             return result;
         }
         if (!HidD_GetPreparsedData(readHandle_, &preparsedData_)) {
             const auto result = HRESULT_FROM_WIN32(GetLastError());
-            Close();
+            CloseHandlesOnly();
             return result;
         }
         HIDP_CAPS capabilities{};
@@ -85,16 +97,21 @@ public:
                 HIDP_STATUS_SUCCESS ||
             capabilities.InputReportByteLength == 0 ||
             capabilities.InputReportByteLength > readBuffer_.size()) {
-            Close();
+            CloseHandlesOnly();
             return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
         }
         inputReportBytes_ = capabilities.InputReportByteLength;
         const auto readResult = BeginRead();
         if (FAILED(readResult)) {
-            Close();
+            CloseHandlesOnly();
             return readResult;
         }
-        return StopAll();
+        const auto neutralResult = StopAll();
+        if (FAILED(neutralResult)) {
+            CloseHandlesOnly();
+            return neutralResult;
+        }
+        return S_OK;
     }
 
     HRESULT Constant(
@@ -113,6 +130,11 @@ public:
         return baseConstant_ == 0
             ? Send(dfgt::reports::StopSlotOne())
             : Send(dfgt::reports::Constant(baseConstant_));
+    }
+
+    HRESULT StopSoftwareSlot() noexcept {
+        baseConstant_ = 0;
+        return Send(dfgt::reports::StopSlotOne());
     }
 
     HRESULT SetRange(std::int32_t degrees) noexcept {
@@ -258,6 +280,14 @@ public:
             StopAll();
             Send(dfgt::reports::Range(900));
         }
+        CloseHandlesOnly();
+        rangeDegrees_ = 900;
+        baseConstant_ = 0;
+        rangeLockState_ = 0;
+    }
+
+private:
+    void CloseHandlesOnly() noexcept {
         if (readHandle_ != INVALID_HANDLE_VALUE) {
             CancelIoEx(readHandle_, &readOverlapped_);
             CloseHandle(readHandle_);
@@ -273,14 +303,14 @@ public:
             readEvent_ = nullptr;
         }
         if (handle_ != INVALID_HANDLE_VALUE) {
+            CancelIoEx(handle_, nullptr);
             CloseHandle(handle_);
             handle_ = INVALID_HANDLE_VALUE;
         }
-        rangeDegrees_ = 900;
-        baseConstant_ = 0;
-        rangeLockState_ = 0;
+        inputReportBytes_ = 0;
     }
 
+public:
     HRESULT ApplyProfile(
         const dfgt::ipc::control::Profile& profile) noexcept {
         if (profile.id[dfgt::ipc::control::ProfileIdCharacters - 1] != L'\0' ||
@@ -373,24 +403,60 @@ private:
     }
 
     HRESULT Send(const std::array<std::uint8_t, 8>& report) noexcept {
-        if (handle_ == INVALID_HANDLE_VALUE) return HRESULT_FROM_WIN32(ERROR_DEVICE_NOT_CONNECTED);
-        if (HidD_SetOutputReport(
-                handle_,
-                const_cast<std::uint8_t*>(report.data()),
-                static_cast<ULONG>(report.size()))) {
-            return S_OK;
+        if (handle_ == INVALID_HANDLE_VALUE) {
+            return HRESULT_FROM_WIN32(ERROR_DEVICE_NOT_CONNECTED);
         }
+        struct PendingWrite final {
+            OVERLAPPED overlapped{};
+            std::array<std::uint8_t, 8> bytes{};
+            HANDLE event{nullptr};
+            ~PendingWrite() {
+                if (event != nullptr) CloseHandle(event);
+            }
+        };
+        auto pending = std::make_unique<PendingWrite>();
+        pending->bytes = report;
+        const auto event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (event == nullptr) return HRESULT_FROM_WIN32(GetLastError());
+        pending->event = event;
+        pending->overlapped.hEvent = event;
         DWORD written = 0;
-        if (WriteFile(
+        const auto completed = WriteFile(
                 handle_,
-                report.data(),
-                static_cast<DWORD>(report.size()),
+                pending->bytes.data(),
+                static_cast<DWORD>(pending->bytes.size()),
                 &written,
-                nullptr) &&
-            written == report.size()) {
-            return S_OK;
+                &pending->overlapped);
+        if (!completed) {
+            const auto error = GetLastError();
+            if (error != ERROR_IO_PENDING) {
+                return HRESULT_FROM_WIN32(error);
+            }
+            const auto wait = WaitForSingleObject(
+                event, kHidWriteTimeoutMs);
+            if (wait != WAIT_OBJECT_0) {
+                CancelIoEx(handle_, &pending->overlapped);
+                if (WaitForSingleObject(
+                        event, kHidWriteTimeoutMs) != WAIT_OBJECT_0) {
+                    // Preserve the OVERLAPPED and buffer if a broken driver
+                    // ignores cancellation. The broker remains responsive;
+                    // process teardown reclaims this quarantined allocation.
+                    pending.release();
+                }
+                return wait == WAIT_TIMEOUT
+                    ? HRESULT_FROM_WIN32(ERROR_TIMEOUT)
+                    : HRESULT_FROM_WIN32(GetLastError());
+            }
+            if (!GetOverlappedResult(
+                    handle_, &pending->overlapped, &written, FALSE)) {
+                const auto result =
+                    HRESULT_FROM_WIN32(GetLastError());
+                return result;
+            }
         }
-        return HRESULT_FROM_WIN32(GetLastError());
+        return written == report.size()
+            ? S_OK
+            : HRESULT_FROM_WIN32(ERROR_WRITE_FAULT);
     }
 
     HANDLE handle_{INVALID_HANDLE_VALUE};
@@ -416,31 +482,79 @@ private:
 };
 
 struct BrokerState final {
-    std::mutex mutex;
+    // Lock order: stateMutex is never held during OS I/O. deviceMutex only
+    // serializes access to HidDevice and must never be acquired while holding
+    // stateMutex.
+    std::mutex stateMutex;
+    std::timed_mutex deviceMutex;
     HidDevice device;
     bool ffbClientConnected{false};
     bool controlClientConnected{false};
     std::uint32_t failSafeCount{0};
     HRESULT lastResult{S_OK};
+    dfgt::broker::SafetyState safety;
+    std::atomic<std::uint64_t> safetyGeneration{0};
+    std::atomic<bool> stopRecoveryRequested{false};
 };
+
+void RunStopRecovery(
+    BrokerState& state,
+    std::stop_token stop) {
+    while (!stop.stop_requested()) {
+        if (!state.stopRecoveryRequested.exchange(false)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            continue;
+        }
+        for (const auto delay : dfgt::broker::StopRecoveryBackoff) {
+            std::this_thread::sleep_for(delay);
+            if (stop.stop_requested()) return;
+            HRESULT result = S_OK;
+            {
+                std::scoped_lock lock(state.deviceMutex);
+                result = state.device.StopAll();
+            }
+            {
+                std::scoped_lock lock(state.stateMutex);
+                state.lastResult = result;
+                if (SUCCEEDED(result)) {
+                    state.safety.ConfirmAllStopped();
+                } else {
+                    state.safety.MarkStopUnconfirmed(result);
+                }
+            }
+            if (SUCCEEDED(result)) {
+                state.stopRecoveryRequested = false;
+                break;
+            }
+        }
+    }
+}
 
 bool ReadMessageWithTimeout(
     HANDLE pipe,
+    const dfgt::broker::ClientProcessWatch& clientProcess,
     dfgt::ipc::Message& message,
     bool forceActive,
     ULONGLONG leaseDeadline,
     BrokerState& state) {
     for (;;) {
+        if (clientProcess.Terminated()) {
+            SetLastError(ERROR_PROCESS_ABORTED);
+            return false;
+        }
         HRESULT rangeLockResult = S_OK;
         {
-            std::scoped_lock lock(state.mutex);
+            std::scoped_lock lock(state.deviceMutex);
             rangeLockResult = state.device.PollRangeLock();
         }
         if (FAILED(rangeLockResult)) {
             {
-                std::scoped_lock lock(state.mutex);
+                std::scoped_lock lock(state.deviceMutex);
                 state.device.StopAll();
                 state.device.SetRange(900);
+            }
+            {
+                std::scoped_lock lock(state.stateMutex);
                 state.lastResult = rangeLockResult;
                 ++state.failSafeCount;
             }
@@ -456,8 +570,18 @@ bool ReadMessageWithTimeout(
         if (forceActive && GetTickCount64() >= leaseDeadline) {
             HRESULT result = S_OK;
             {
-                std::scoped_lock lock(state.mutex);
-                result = state.device.StopAll();
+                result = dfgt::broker::TryEmergencyIo(
+                    state.deviceMutex,
+                    std::chrono::milliseconds(5),
+                    [&]() noexcept { return state.device.StopAll(); });
+            }
+            {
+                std::scoped_lock lock(state.stateMutex);
+                if (SUCCEEDED(result)) state.safety.ConfirmAllStopped();
+                else {
+                    state.safety.MarkStopUnconfirmed(result);
+                    state.stopRecoveryRequested = true;
+                }
                 state.lastResult = result;
                 ++state.failSafeCount;
             }
@@ -471,13 +595,26 @@ bool ReadMessageWithTimeout(
         }
         DWORD available = 0;
         if (!PeekNamedPipe(pipe, nullptr, 0, nullptr, &available, nullptr)) return false;
-        if (available >= sizeof(message)) {
-            DWORD bytesRead = 0;
-            return ReadFile(pipe, &message, sizeof(message), &bytesRead, nullptr) &&
-                bytesRead == sizeof(message);
+        if (available >= dfgt::ipc::wire::MessageSize) {
+            dfgt::ipc::wire::EncodedMessage encoded{};
+            const auto read = dfgt::io::ReadExact(
+                pipe, encoded.data(),
+                static_cast<DWORD>(encoded.size()),
+                kPipeIoTimeoutMs);
+            if (!read.Succeeded(
+                    static_cast<DWORD>(encoded.size())) ||
+                !dfgt::ipc::wire::Decode(encoded, message)) {
+                SetLastError(HRESULT_CODE(read.result));
+                if (SUCCEEDED(read.result)) {
+                    SetLastError(ERROR_INVALID_DATA);
+                }
+                return false;
+            }
+            return true;
         }
         if (!forceActive && GetTickCount64() >= leaseDeadline) {
-            SetLastError(ERROR_TIMEOUT);
+            SetLastError(
+                available == 0 ? ERROR_TIMEOUT : ERROR_INVALID_DATA);
             return false;
         }
         Sleep(5);
@@ -489,6 +626,8 @@ HRESULT ProcessMessage(
     BrokerState& state,
     bool& opened,
     bool& forceActive,
+    std::uint64_t& sessionGeneration,
+    std::uint64_t expectedNonce,
     bool suppressForceWrites) {
     using dfgt::ipc::Command;
     if (message.magic != dfgt::ipc::Magic ||
@@ -496,111 +635,284 @@ HRESULT ProcessMessage(
         message.size != sizeof(message)) {
         return E_INVALIDARG;
     }
+    if (message.capabilities !=
+            dfgt::ipc::RequiredCapabilities ||
+        message.buildId != dfgt::ipc::BuildId ||
+        (message.command == Command::Open
+            ? message.sessionNonce != 0
+            : message.sessionNonce != expectedNonce)) {
+        return E_ACCESSDENIED;
+    }
 
     switch (message.command) {
     case Command::Open: {
         if (message.devicePath[dfgt::ipc::DevicePathCharacters - 1] != L'\0') {
             return E_INVALIDARG;
         }
-        std::scoped_lock lock(state.mutex);
         auto result = S_OK;
-        if (!state.device.IsOpen()) {
-            result = state.device.Open(message.devicePath);
+        {
+            std::scoped_lock lock(state.stateMutex);
+            state.safety.BeginInitialize();
+        }
+        {
+            std::scoped_lock lock(state.deviceMutex);
+            if (!state.device.IsOpen()) {
+                result = state.device.Open(message.devicePath);
+            }
         }
         opened = SUCCEEDED(result);
-        state.ffbClientConnected = opened;
-        state.lastResult = result;
+        sessionGeneration = state.safetyGeneration.load();
         forceActive = false;
+        {
+            std::scoped_lock lock(state.stateMutex);
+            state.ffbClientConnected = opened;
+            state.lastResult = result;
+            if (opened &&
+                state.safety.Mode() ==
+                    dfgt::broker::SafetyMode::Initializing) {
+                state.safety.ConfirmNeutralReady();
+                result = state.safety.Arm();
+                state.lastResult = result;
+            } else if (FAILED(result)) {
+                state.safety.MarkStopUnconfirmed(result);
+                state.stopRecoveryRequested = true;
+            }
+        }
         return result;
     }
     case Command::Constant:
         if (!opened) return HRESULT_FROM_WIN32(ERROR_DEVICE_NOT_CONNECTED);
+        if (sessionGeneration != state.safetyGeneration.load()) {
+            return dfgt::broker::DFGT_E_EMERGENCY_LATCHED;
+        }
         forceActive =
             message.value != 0 || message.auxiliary != 0;
         if (suppressForceWrites) return S_OK;
         {
-            std::scoped_lock lock(state.mutex);
-            const auto result = forceActive
-                ? state.device.Constant(
-                    message.value,
-                    message.auxiliary)
-                : state.device.StopAll();
+            if (forceActive) {
+                std::scoped_lock lock(state.stateMutex);
+                const auto allowed = state.safety.CanAcceptForce();
+                if (FAILED(allowed)) return allowed;
+            }
+            HRESULT result = S_OK;
+            {
+                std::scoped_lock lock(state.deviceMutex);
+                if (sessionGeneration !=
+                    state.safetyGeneration.load()) {
+                    return dfgt::broker::DFGT_E_EMERGENCY_LATCHED;
+                }
+                result = forceActive
+                    ? state.device.Constant(
+                        message.value, message.auxiliary)
+                    : state.device.StopSoftwareSlot();
+            }
+            std::scoped_lock lock(state.stateMutex);
+            if (SUCCEEDED(result)) {
+                if (forceActive) {
+                    state.safety.Activate(
+                        dfgt::broker::PhysicalSlot::Software);
+                } else {
+                    state.safety.ConfirmSlotStopped(
+                        dfgt::broker::PhysicalSlot::Software);
+                }
+            } else {
+                state.safety.MarkStopUnconfirmed(result);
+                state.stopRecoveryRequested = true;
+            }
+            state.lastResult = result;
+            return result;
+        }
+    case Command::StopSoftwareSlot:
+        forceActive = false;
+        {
+            HRESULT result = S_OK;
+            {
+                std::scoped_lock lock(state.deviceMutex);
+                result = state.device.StopSoftwareSlot();
+            }
+            std::scoped_lock lock(state.stateMutex);
+            if (SUCCEEDED(result)) {
+                state.safety.ConfirmSlotStopped(
+                    dfgt::broker::PhysicalSlot::Software);
+            } else {
+                state.safety.MarkStopUnconfirmed(result);
+                state.stopRecoveryRequested = true;
+            }
             state.lastResult = result;
             return result;
         }
     case Command::StopAll:
         forceActive = false;
         {
-            std::scoped_lock lock(state.mutex);
-            const auto result = state.device.StopAll();
+            HRESULT result = S_OK;
+            {
+                std::scoped_lock lock(state.deviceMutex);
+                result = state.device.StopAll();
+            }
+            std::scoped_lock lock(state.stateMutex);
+            if (SUCCEEDED(result)) {
+                state.safety.ConfirmAllStopped();
+            } else {
+                state.safety.MarkStopUnconfirmed(result);
+                state.stopRecoveryRequested = true;
+            }
             state.lastResult = result;
             return result;
         }
     case Command::SetRange:
         if (!opened) return HRESULT_FROM_WIN32(ERROR_DEVICE_NOT_CONNECTED);
+        if (sessionGeneration != state.safetyGeneration.load()) {
+            return dfgt::broker::DFGT_E_EMERGENCY_LATCHED;
+        }
         {
-            std::scoped_lock lock(state.mutex);
-            const auto result = state.device.SetRange(message.value);
+            HRESULT result = S_OK;
+            {
+                std::scoped_lock lock(state.deviceMutex);
+                if (sessionGeneration !=
+                    state.safetyGeneration.load()) {
+                    return dfgt::broker::DFGT_E_EMERGENCY_LATCHED;
+                }
+                result = state.device.SetRange(message.value);
+            }
+            std::scoped_lock lock(state.stateMutex);
             state.lastResult = result;
             return result;
         }
     case Command::Spring:
         if (!opened) return HRESULT_FROM_WIN32(ERROR_DEVICE_NOT_CONNECTED);
+        if (sessionGeneration != state.safetyGeneration.load()) {
+            return dfgt::broker::DFGT_E_EMERGENCY_LATCHED;
+        }
         forceActive = true;
         if (suppressForceWrites) return S_OK;
         {
-            std::scoped_lock lock(state.mutex);
-            const auto result = state.device.Spring(
-            message.value,
-            message.auxiliary,
-            message.value3,
-            message.value4,
-            message.value5,
-            message.value6);
+            {
+                std::scoped_lock lock(state.stateMutex);
+                const auto allowed = state.safety.CanAcceptForce();
+                if (FAILED(allowed)) return allowed;
+            }
+            HRESULT result = S_OK;
+            {
+                std::scoped_lock lock(state.deviceMutex);
+                if (sessionGeneration !=
+                    state.safetyGeneration.load()) {
+                    return dfgt::broker::DFGT_E_EMERGENCY_LATCHED;
+                }
+                result = state.device.Spring(
+                    message.value, message.auxiliary,
+                    message.value3, message.value4,
+                    message.value5, message.value6);
+            }
+            std::scoped_lock lock(state.stateMutex);
+            if (SUCCEEDED(result)) {
+                state.safety.Activate(
+                    dfgt::broker::PhysicalSlot::Spring);
+            } else {
+                state.safety.MarkStopUnconfirmed(result);
+                state.stopRecoveryRequested = true;
+            }
             state.lastResult = result;
             return result;
         }
     case Command::Damper:
         if (!opened) return HRESULT_FROM_WIN32(ERROR_DEVICE_NOT_CONNECTED);
+        if (sessionGeneration != state.safetyGeneration.load()) {
+            return dfgt::broker::DFGT_E_EMERGENCY_LATCHED;
+        }
         forceActive = true;
         if (suppressForceWrites) return S_OK;
         {
-            std::scoped_lock lock(state.mutex);
-            const auto result = state.device.Damper(
-            message.value,
-            message.auxiliary,
-            message.value5,
-            message.value6);
+            {
+                std::scoped_lock lock(state.stateMutex);
+                const auto allowed = state.safety.CanAcceptForce();
+                if (FAILED(allowed)) return allowed;
+            }
+            HRESULT result = S_OK;
+            {
+                std::scoped_lock lock(state.deviceMutex);
+                if (sessionGeneration !=
+                    state.safetyGeneration.load()) {
+                    return dfgt::broker::DFGT_E_EMERGENCY_LATCHED;
+                }
+                result = state.device.Damper(
+                    message.value, message.auxiliary,
+                    message.value5, message.value6);
+            }
+            std::scoped_lock lock(state.stateMutex);
+            if (SUCCEEDED(result)) {
+                state.safety.Activate(
+                    dfgt::broker::PhysicalSlot::DamperOrInertia);
+            } else {
+                state.safety.MarkStopUnconfirmed(result);
+                state.stopRecoveryRequested = true;
+            }
             state.lastResult = result;
             return result;
         }
     case Command::Friction:
         if (!opened) return HRESULT_FROM_WIN32(ERROR_DEVICE_NOT_CONNECTED);
+        if (sessionGeneration != state.safetyGeneration.load()) {
+            return dfgt::broker::DFGT_E_EMERGENCY_LATCHED;
+        }
         forceActive = true;
         if (suppressForceWrites) return S_OK;
         {
-            std::scoped_lock lock(state.mutex);
-            const auto result = state.device.Friction(
-            message.value,
-            message.auxiliary,
-            message.value5,
-            message.value6);
+            {
+                std::scoped_lock lock(state.stateMutex);
+                const auto allowed = state.safety.CanAcceptForce();
+                if (FAILED(allowed)) return allowed;
+            }
+            HRESULT result = S_OK;
+            {
+                std::scoped_lock lock(state.deviceMutex);
+                if (sessionGeneration !=
+                    state.safetyGeneration.load()) {
+                    return dfgt::broker::DFGT_E_EMERGENCY_LATCHED;
+                }
+                result = state.device.Friction(
+                    message.value, message.auxiliary,
+                    message.value5, message.value6);
+            }
+            std::scoped_lock lock(state.stateMutex);
+            if (SUCCEEDED(result)) {
+                state.safety.Activate(
+                    dfgt::broker::PhysicalSlot::Friction);
+            } else {
+                state.safety.MarkStopUnconfirmed(result);
+                state.stopRecoveryRequested = true;
+            }
             state.lastResult = result;
             return result;
         }
     case Command::Heartbeat:
-        return opened ? S_OK : HRESULT_FROM_WIN32(ERROR_DEVICE_NOT_CONNECTED);
+        if (!opened) return HRESULT_FROM_WIN32(ERROR_DEVICE_NOT_CONNECTED);
+        return sessionGeneration == state.safetyGeneration.load()
+            ? S_OK
+            : dfgt::broker::DFGT_E_EMERGENCY_LATCHED;
     case Command::Close:
         forceActive = false;
         opened = false;
         {
-            std::scoped_lock lock(state.mutex);
-            state.ffbClientConnected = false;
-            const auto result = state.device.StopAll();
-            state.lastResult = result;
-            if (!state.controlClientConnected) {
-                state.device.SetRange(900);
+            bool resetRange = false;
+            {
+                std::scoped_lock lock(state.stateMutex);
+                state.ffbClientConnected = false;
+                resetRange = !state.controlClientConnected;
             }
+            HRESULT result = S_OK;
+            {
+                std::scoped_lock lock(state.deviceMutex);
+                result = state.device.StopAll();
+                if (resetRange) state.device.SetRange(900);
+            }
+            std::scoped_lock lock(state.stateMutex);
+            if (SUCCEEDED(result)) {
+                state.safety.ConfirmAllStopped();
+            } else {
+                state.safety.MarkStopUnconfirmed(result);
+                state.stopRecoveryRequested = true;
+            }
+            state.lastResult = result;
         }
         return S_OK;
     default:
@@ -608,13 +920,40 @@ HRESULT ProcessMessage(
     }
 }
 
-bool WriteResponse(HANDLE pipe, std::uint32_t sequence, HRESULT result) {
+bool WriteResponse(
+    HANDLE pipe,
+    std::uint32_t sequence,
+    HRESULT result,
+    std::uint64_t sessionNonce,
+    BrokerState& state) {
     dfgt::ipc::Response response{};
     response.sequence = sequence;
     response.result = result;
-    DWORD written = 0;
-    return WriteFile(pipe, &response, sizeof(response), &written, nullptr) &&
-        written == sizeof(response);
+    response.capabilities = dfgt::ipc::RequiredCapabilities;
+    response.sessionNonce = sessionNonce;
+    response.buildId = dfgt::ipc::BuildId;
+    {
+        std::scoped_lock lock(state.stateMutex);
+        response.safetyMode =
+            static_cast<std::uint32_t>(state.safety.Mode());
+        response.activeSlots =
+            static_cast<std::uint32_t>(
+                state.safety.ActiveSlots());
+        response.connected =
+            state.safety.Mode() !=
+                dfgt::broker::SafetyMode::Disconnected
+            ? 1u
+            : 0u;
+        response.stopConfirmed =
+            state.safety.StopConfirmed() ? 1u : 0u;
+    }
+    const auto encoded = dfgt::ipc::wire::Encode(response);
+    const auto write = dfgt::io::WriteExact(
+        pipe, encoded.data(),
+        static_cast<DWORD>(encoded.size()),
+        kPipeIoTimeoutMs);
+    return write.Succeeded(
+        static_cast<DWORD>(encoded.size()));
 }
 
 SECURITY_ATTRIBUTES MakePipeSecurity(PSECURITY_DESCRIPTOR& descriptor) {
@@ -677,19 +1016,50 @@ int RunClient(
     BrokerState& state,
     bool diagnostics,
     bool suppressForceWrites) {
+    ULONG clientPid = 0;
+    ULONG clientSession = 0;
+    GetNamedPipeClientProcessId(pipe, &clientPid);
+    GetNamedPipeClientSessionId(pipe, &clientSession);
+    dfgt::broker::ClientProcessWatch clientProcess(clientPid);
+    std::uint64_t sessionNonce = 0;
+    const auto nonceResult = BCryptGenRandom(
+        nullptr,
+        reinterpret_cast<PUCHAR>(&sessionNonce),
+        sizeof(sessionNonce),
+        BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    if (!BCRYPT_SUCCESS(nonceResult)) sessionNonce = 0;
+    if (clientPid == 0 || !clientProcess.Valid() ||
+        sessionNonce == 0) {
+        std::scoped_lock lock(state.stateMutex);
+        state.lastResult = HRESULT_FROM_WIN32(ERROR_ACCESS_DENIED);
+        ++state.failSafeCount;
+        return 1;
+    }
+    std::wcout
+        << L"{\"event\":\"ffb-session-open\",\"pid\":"
+        << clientPid << L",\"session\":" << clientSession
+        << L",\"nonce\":" << sessionNonce << L"}\n"
+        << std::flush;
     bool opened = false;
     bool forceActive = false;
+    std::uint64_t sessionGeneration = 0;
     std::uint64_t messageCount = 0;
     std::uint64_t constantCount = 0;
     std::uint64_t nonzeroConstantCount = 0;
     std::int32_t maximumAbsoluteConstant = 0;
     std::uint64_t stopAllCount = 0;
     std::uint64_t heartbeatCount = 0;
+    std::uint32_t lastSequence = 0;
+    dfgt::broker::LeaseWatchdog watchdog{
+        std::chrono::milliseconds(kReadTimeoutMs)};
+    const auto watchdogStart = std::chrono::steady_clock::now();
+    watchdog.Reset(watchdogStart);
     ULONGLONG leaseDeadline = GetTickCount64() + kReadTimeoutMs;
     for (;;) {
         dfgt::ipc::Message message{};
         if (!ReadMessageWithTimeout(
                 pipe,
+                clientProcess,
                 message,
                 forceActive,
                 leaseDeadline,
@@ -700,14 +1070,25 @@ int RunClient(
                 continue;
             }
             HRESULT result = S_OK;
+            bool resetRange = false;
             {
-                std::scoped_lock lock(state.mutex);
+                std::scoped_lock lock(state.stateMutex);
+                resetRange = !state.controlClientConnected;
+            }
+            {
+                std::scoped_lock lock(state.deviceMutex);
                 result = state.device.StopAll();
+                if (resetRange) state.device.SetRange(900);
+            }
+            {
+                std::scoped_lock lock(state.stateMutex);
                 state.ffbClientConnected = false;
                 state.lastResult = result;
                 ++state.failSafeCount;
-                if (!state.controlClientConnected) {
-                    state.device.SetRange(900);
+                if (SUCCEEDED(result)) state.safety.ConfirmAllStopped();
+                else {
+                    state.safety.MarkStopUnconfirmed(result);
+                    state.stopRecoveryRequested = true;
                 }
             }
             std::wcout
@@ -717,12 +1098,25 @@ int RunClient(
                 << std::flush;
             return 0;
         }
-        const auto result = ProcessMessage(
-            message,
-            state,
-            opened,
-            forceActive,
-            suppressForceWrites);
+        const auto sequenceValid =
+            message.sequence > lastSequence;
+        const auto effectiveResult = sequenceValid
+            ? ProcessMessage(
+                message,
+                state,
+                opened,
+                forceActive,
+                sessionGeneration,
+                sessionNonce,
+                suppressForceWrites)
+            : E_INVALIDARG;
+        if (sequenceValid) lastSequence = message.sequence;
+        {
+            std::scoped_lock lock(state.stateMutex);
+            forceActive =
+                state.safety.ActiveSlots() !=
+                dfgt::broker::PhysicalSlot::None;
+        }
         if (diagnostics &&
             message.command != dfgt::ipc::Command::Heartbeat) {
             std::wcout
@@ -731,7 +1125,7 @@ int RunClient(
                 << L",\"command\":"
                 << static_cast<std::uint32_t>(message.command)
                 << L",\"value\":" << message.value
-                << L",\"result\":" << result
+                << L",\"result\":" << effectiveResult
                 << L"}\n"
                 << std::flush;
         }
@@ -748,21 +1142,49 @@ int RunClient(
         } else if (message.command == dfgt::ipc::Command::Heartbeat) {
             ++heartbeatCount;
         }
-        if (SUCCEEDED(result) && forceActive &&
+        const auto now = std::chrono::steady_clock::now();
+        const auto rendererProgressed =
+            message.command != dfgt::ipc::Command::Heartbeat ||
+            watchdog.ObserveRenderer(message.renderEpoch, now);
+        if (SUCCEEDED(effectiveResult) && forceActive && rendererProgressed &&
             (message.command == dfgt::ipc::Command::Constant ||
              message.command == dfgt::ipc::Command::Spring ||
              message.command == dfgt::ipc::Command::Damper ||
              message.command == dfgt::ipc::Command::Friction ||
              message.command == dfgt::ipc::Command::Heartbeat)) {
-            leaseDeadline = GetTickCount64() + kReadTimeoutMs;
+            if (message.command != dfgt::ipc::Command::Heartbeat) {
+                watchdog.ObserveForceCommand(now);
+            }
+            leaseDeadline = GetTickCount64() +
+                static_cast<ULONGLONG>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        watchdog.Deadline() - now).count());
         } else if (!forceActive) {
             leaseDeadline = GetTickCount64() + kReadTimeoutMs;
         }
-        if (!WriteResponse(pipe, message.sequence, result)) {
-            std::scoped_lock lock(state.mutex);
-            state.device.StopAll();
-            state.ffbClientConnected = false;
-            ++state.failSafeCount;
+        if (!WriteResponse(
+                pipe, message.sequence, effectiveResult,
+                sessionNonce, state)) {
+            HRESULT stopResult = S_OK;
+            {
+                std::scoped_lock lock(state.deviceMutex);
+                stopResult = state.device.StopAll();
+            }
+            {
+                std::scoped_lock lock(state.stateMutex);
+                state.ffbClientConnected = false;
+                ++state.failSafeCount;
+                state.lastResult = stopResult;
+                if (SUCCEEDED(stopResult)) state.safety.ConfirmAllStopped();
+                else {
+                    state.safety.MarkStopUnconfirmed(stopResult);
+                    state.stopRecoveryRequested = true;
+                }
+            }
+            return 0;
+        }
+        if (!sequenceValid ||
+            effectiveResult == E_ACCESSDENIED) {
             return 0;
         }
         if (message.command == dfgt::ipc::Command::Close) {
@@ -785,14 +1207,25 @@ int RunClient(
 }
 
 dfgt::ipc::control::Status SnapshotStatus(BrokerState& state) {
-    std::scoped_lock lock(state.mutex);
-    auto status = state.device.Status();
+    dfgt::ipc::control::Status status{};
+    {
+        std::scoped_lock lock(state.deviceMutex);
+        status = state.device.Status();
+    }
+    std::scoped_lock lock(state.stateMutex);
     status.ffbClientConnected =
         state.ffbClientConnected ? 1u : 0u;
     status.controlClientConnected =
         state.controlClientConnected ? 1u : 0u;
     status.failSafeCount = state.failSafeCount;
     status.lastResult = state.lastResult;
+    status.safetyMode =
+        static_cast<std::uint32_t>(state.safety.Mode());
+    status.activeSlots =
+        static_cast<std::uint32_t>(state.safety.ActiveSlots());
+    status.stopConfirmed = state.safety.StopConfirmed() ? 1u : 0u;
+    status.lastSafetyError = state.safety.LastSafetyError();
+    status.safetyGeneration = state.safetyGeneration.load();
     if (FAILED(state.lastResult)) {
         status.state = dfgt::ipc::control::DeviceState::Faulted;
     } else if (!status.connected) {
@@ -809,15 +1242,25 @@ dfgt::ipc::control::Status SnapshotStatus(BrokerState& state) {
 
 HRESULT ProcessControlRequest(
     const dfgt::ipc::control::Request& request,
-    BrokerState& state) {
+    BrokerState& state,
+    std::uint64_t expectedNonce) {
     using dfgt::ipc::control::Command;
     if (request.magic != dfgt::ipc::control::Magic ||
         request.version != dfgt::ipc::control::Version ||
         request.size != sizeof(request)) {
         return E_INVALIDARG;
     }
+    if (request.capabilities !=
+            dfgt::ipc::RequiredCapabilities ||
+        request.buildId != dfgt::ipc::BuildId ||
+        (request.command ==
+                dfgt::ipc::control::Command::Ping &&
+            request.sessionNonce == 0
+            ? false
+            : request.sessionNonce != expectedNonce)) {
+        return E_ACCESSDENIED;
+    }
 
-    std::scoped_lock lock(state.mutex);
     HRESULT result = S_OK;
     switch (request.command) {
     case Command::Ping:
@@ -827,27 +1270,162 @@ HRESULT ProcessControlRequest(
         if (request.devicePath[
                 dfgt::ipc::DevicePathCharacters - 1] != L'\0') {
             result = E_INVALIDARG;
-        } else if (!state.device.IsOpen()) {
-            result = state.device.Open(request.devicePath);
+        } else {
+            {
+                std::scoped_lock lock(state.stateMutex);
+                state.safety.BeginInitialize();
+            }
+            {
+                std::scoped_lock lock(state.deviceMutex);
+                if (!state.device.IsOpen()) {
+                    result = state.device.Open(request.devicePath);
+                }
+            }
+            {
+                std::scoped_lock lock(state.stateMutex);
+                if (SUCCEEDED(result) &&
+                    state.safety.Mode() ==
+                        dfgt::broker::SafetyMode::Initializing) {
+                    state.safety.ConfirmNeutralReady();
+                    result = state.safety.Arm();
+                } else if (FAILED(result)) {
+                    state.safety.MarkStopUnconfirmed(result);
+                    state.stopRecoveryRequested = true;
+                }
+            }
         }
         break;
-    case Command::ApplyProfile:
+    case Command::ApplyProfile: {
+        {
+            std::scoped_lock lock(state.stateMutex);
+            const auto allowed = state.safety.CanAcceptForce();
+            if (FAILED(allowed)) {
+                result = allowed;
+                break;
+            }
+        }
+        std::scoped_lock lock(state.deviceMutex);
         result = state.device.ApplyProfile(request.profile);
         break;
+    }
     case Command::EmergencyStop:
-        result = state.device.StopAll();
-        ++state.failSafeCount;
+        // Latch and invalidate the current FFB session before touching HID.
+        {
+            HRESULT latchResult = S_OK;
+            {
+                std::scoped_lock lock(state.stateMutex);
+                latchResult = state.safety.LatchEmergency();
+                ++state.safetyGeneration;
+            }
+            {
+                result = dfgt::broker::TryEmergencyIo(
+                    state.deviceMutex,
+                    std::chrono::milliseconds(5),
+                    [&]() noexcept { return state.device.StopAll(); });
+            }
+            {
+                std::scoped_lock lock(state.stateMutex);
+                if (SUCCEEDED(result)) {
+                    state.safety.ConfirmAllStopped();
+                    result = latchResult;
+                } else {
+                    state.safety.MarkStopUnconfirmed(result);
+                    state.stopRecoveryRequested = true;
+                }
+                ++state.failSafeCount;
+            }
+        }
         break;
-    case Command::DetachDevice:
-        state.device.StopAll();
-        state.device.SetRange(900);
-        if (!state.ffbClientConnected) state.device.Close();
+    case Command::AcknowledgeAndRearm: {
+        bool deviceOpen = false;
+        {
+            std::scoped_lock lock(state.deviceMutex);
+            deviceOpen = state.device.IsOpen();
+        }
+        std::scoped_lock lock(state.stateMutex);
+        result = state.safety.AcknowledgeAndRearm(
+            deviceOpen,
+            state.safety.StopConfirmed());
         break;
+    }
+    case Command::DetachDevice: {
+        bool closeDevice = false;
+        {
+            std::scoped_lock lock(state.stateMutex);
+            closeDevice = !state.ffbClientConnected;
+        }
+        {
+            std::scoped_lock lock(state.deviceMutex);
+            result = state.device.StopAll();
+            state.device.SetRange(900);
+            if (closeDevice) state.device.Close();
+        }
+        if (closeDevice &&
+            result ==
+                HRESULT_FROM_WIN32(ERROR_DEVICE_NOT_CONNECTED)) {
+            // The inbox HID stack has already removed the physical device.
+            // Closing the stale handle is the only possible neutral state.
+            result = S_OK;
+        }
+        {
+            std::scoped_lock lock(state.stateMutex);
+            if (SUCCEEDED(result)) {
+                state.safety.ConfirmAllStopped();
+                state.safety.Disconnect();
+            } else {
+                state.safety.MarkStopUnconfirmed(result);
+                state.stopRecoveryRequested = true;
+            }
+        }
+        break;
+    }
+    case Command::PrepareForMaintenance: {
+        {
+            std::scoped_lock lock(state.stateMutex);
+            if (state.ffbClientConnected) {
+                result = HRESULT_FROM_WIN32(ERROR_BUSY);
+                break;
+            }
+        }
+        HRESULT stopResult = E_FAIL;
+        HRESULT rangeResult = E_FAIL;
+        {
+            std::scoped_lock lock(state.deviceMutex);
+            if (!state.device.IsOpen()) {
+                stopResult = S_OK;
+                rangeResult = S_OK;
+            } else {
+                stopResult = state.device.StopAll();
+                rangeResult = SUCCEEDED(stopResult)
+                    ? state.device.SetRange(900)
+                    : stopResult;
+            }
+            if (SUCCEEDED(stopResult) &&
+                SUCCEEDED(rangeResult)) {
+                state.device.Close();
+            }
+        }
+        result = FAILED(stopResult) ? stopResult : rangeResult;
+        {
+            std::scoped_lock lock(state.stateMutex);
+            if (SUCCEEDED(result)) {
+                state.safety.ConfirmAllStopped();
+                state.safety.EnterMaintenanceSafe();
+            } else {
+                state.safety.MarkStopUnconfirmed(result);
+                state.stopRecoveryRequested = true;
+            }
+        }
+        break;
+    }
     default:
         result = E_INVALIDARG;
         break;
     }
-    state.lastResult = result;
+    {
+        std::scoped_lock lock(state.stateMutex);
+        state.lastResult = result;
+    }
     return result;
 }
 
@@ -859,7 +1437,8 @@ void RunControlServer(
     while (!stop.stop_requested()) {
         const auto pipe = CreateNamedPipeW(
             dfgt::ipc::ControlPipeName,
-            PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
+            PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE |
+                FILE_FLAG_OVERLAPPED,
             PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT |
                 PIPE_REJECT_REMOTE_CLIENTS,
             1,
@@ -874,43 +1453,97 @@ void RunControlServer(
             return;
         }
 
-        const auto connected = ConnectNamedPipe(pipe, nullptr);
-        const auto error = connected ? ERROR_SUCCESS : GetLastError();
-        if (!connected && error != ERROR_PIPE_CONNECTED) {
+        const auto connectResult =
+            dfgt::io::ConnectPipe(pipe, kPipeIoTimeoutMs);
+        if (FAILED(connectResult)) {
             CloseHandle(pipe);
             if (stop.stop_requested()) return;
             continue;
         }
+        ULONG clientPid = 0;
+        ULONG clientSession = 0;
+        DWORD brokerSession = 0;
+        GetNamedPipeClientProcessId(pipe, &clientPid);
+        GetNamedPipeClientSessionId(pipe, &clientSession);
+        ProcessIdToSessionId(
+            GetCurrentProcessId(), &brokerSession);
+        dfgt::broker::ClientProcessWatch clientProcess(clientPid);
+        std::uint64_t sessionNonce = 0;
+        const auto nonceReady = BCRYPT_SUCCESS(BCryptGenRandom(
+            nullptr,
+            reinterpret_cast<PUCHAR>(&sessionNonce),
+            sizeof(sessionNonce),
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG));
+        if (clientPid == 0 || !clientProcess.Valid() ||
+            clientSession != brokerSession ||
+            !nonceReady || sessionNonce == 0) {
+            DisconnectNamedPipe(pipe);
+            CloseHandle(pipe);
+            continue;
+        }
         {
-            std::scoped_lock lock(state.mutex);
+            std::scoped_lock lock(state.stateMutex);
             state.controlClientConnected = true;
         }
+        std::uint32_t lastSequence = 0;
 
         for (;;) {
             dfgt::ipc::control::Request request{};
-            DWORD bytesRead = 0;
-            if (!ReadFile(
-                    pipe,
-                    &request,
-                    sizeof(request),
-                    &bytesRead,
-                    nullptr) ||
-                bytesRead != sizeof(request)) {
+            dfgt::ipc::control::wire::EncodedRequest encodedRequest{};
+            const auto read = dfgt::io::ReadExact(
+                pipe, encodedRequest.data(),
+                static_cast<DWORD>(encodedRequest.size()),
+                kPipeIoTimeoutMs);
+            if (!read.Succeeded(
+                    static_cast<DWORD>(encodedRequest.size())) ||
+                !dfgt::ipc::control::wire::Decode(
+                    encodedRequest, request)) {
+                if (read.result ==
+                        HRESULT_FROM_WIN32(ERROR_TIMEOUT) &&
+                    !stop.stop_requested()) {
+                    DWORD available = 0;
+                    if (PeekNamedPipe(
+                            pipe, nullptr, 0, nullptr,
+                            &available, nullptr) &&
+                        available == 0 &&
+                        !clientProcess.Terminated()) {
+                        continue;
+                    }
+                }
                 break;
             }
-            const auto result = ProcessControlRequest(request, state);
+            const auto sequenceValid =
+                request.sequence > lastSequence;
+            const auto firstPing =
+                lastSequence == 0 &&
+                request.command ==
+                    dfgt::ipc::control::Command::Ping &&
+                request.sessionNonce == 0;
+            const auto nonceValid =
+                firstPing ||
+                request.sessionNonce == sessionNonce;
+            const auto result =
+                sequenceValid && nonceValid
+                ? ProcessControlRequest(
+                    request, state, sessionNonce)
+                : E_ACCESSDENIED;
+            if (sequenceValid) lastSequence = request.sequence;
             dfgt::ipc::control::Response response{};
             response.sequence = request.sequence;
             response.result = result;
             response.status = SnapshotStatus(state);
-            DWORD written = 0;
-            if (!WriteFile(
-                    pipe,
-                    &response,
-                    sizeof(response),
-                    &written,
-                    nullptr) ||
-                written != sizeof(response)) {
+            response.capabilities =
+                dfgt::ipc::RequiredCapabilities;
+            response.sessionNonce = sessionNonce;
+            response.buildId = dfgt::ipc::BuildId;
+            const auto encodedResponse =
+                dfgt::ipc::control::wire::Encode(response);
+            const auto write = dfgt::io::WriteExact(
+                pipe, encodedResponse.data(),
+                static_cast<DWORD>(encodedResponse.size()),
+                kPipeIoTimeoutMs);
+            if (!write.Succeeded(
+                    static_cast<DWORD>(encodedResponse.size()))) {
                 break;
             }
             if (diagnostics) {
@@ -922,10 +1555,14 @@ void RunControlServer(
                     << L",\"result\":" << result << L"}\n"
                     << std::flush;
             }
+            if (!sequenceValid || !nonceValid ||
+                result == E_ACCESSDENIED) {
+                break;
+            }
         }
 
         {
-            std::scoped_lock lock(state.mutex);
+            std::scoped_lock lock(state.stateMutex);
             state.controlClientConnected = false;
         }
         DisconnectNamedPipe(pipe);
@@ -957,6 +1594,10 @@ int wmain(int argc, wchar_t** argv) {
     }
 
     BrokerState state;
+    std::jthread recoveryThread(
+        [&state](std::stop_token stop) {
+            RunStopRecovery(state, stop);
+        });
     std::jthread controlThread(
         [&state, security, diagnostics](std::stop_token stop) {
             RunControlServer(
@@ -968,7 +1609,8 @@ int wmain(int argc, wchar_t** argv) {
     for (;;) {
         const auto pipe = CreateNamedPipeW(
             dfgt::ipc::PipeName,
-            PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
+            PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE |
+                FILE_FLAG_OVERLAPPED,
             PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
             1,
             4096,
@@ -981,9 +1623,8 @@ int wmain(int argc, wchar_t** argv) {
             return 11;
         }
 
-        const auto connected = ConnectNamedPipe(pipe, nullptr);
-        const auto error = connected ? ERROR_SUCCESS : GetLastError();
-        const bool ready = connected || error == ERROR_PIPE_CONNECTED;
+        const bool ready = SUCCEEDED(
+            dfgt::io::ConnectPipe(pipe, kPipeIoTimeoutMs));
 
         if (ready) {
             RunClient(

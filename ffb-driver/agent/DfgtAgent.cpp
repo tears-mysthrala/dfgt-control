@@ -1,10 +1,13 @@
 #include <windows.h>
 #include <shellapi.h>
+#include <dbt.h>
+#include <hidsdi.h>
 
 #include <algorithm>
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <winrt/base.h>
@@ -12,16 +15,22 @@
 #include "ControlClient.h"
 #include "DeviceDiscovery.h"
 #include "ProfileStore.h"
+#include "AgentRecoveryPolicy.h"
+#include "../shared/AgentUiProtocol.h"
+#include "../shared/BoundedIo.h"
+#include "../shared/PipePeerValidation.h"
 
 namespace {
 
 constexpr UINT kTrayMessage = WM_APP + 1;
 constexpr UINT kForegroundChanged = WM_APP + 2;
+constexpr UINT kUiBridgeRequest = WM_APP + 3;
 constexpr UINT_PTR kForegroundTimer = 1;
 constexpr UINT_PTR kMaintenanceTimer = 2;
 constexpr UINT kMenuOpen = 1001;
 constexpr UINT kMenuEmergencyStop = 1002;
 constexpr UINT kMenuExit = 1003;
+constexpr UINT kMenuRearm = 1004;
 constexpr wchar_t kWindowClass[] = L"DfgtControl.Agent.Window";
 
 std::wstring ModuleDirectory() {
@@ -70,6 +79,9 @@ public:
     int Run(HINSTANCE instance) {
         instance_ = instance;
         if (!InitialiseWindow()) return 10;
+        uiServer_ = std::jthread(
+            [this](std::stop_token stop) { RunUiServer(stop); });
+        RegisterForDeviceChanges();
         if (!InitialiseControl()) {
             UpdateTray(L"DFGT Control · broker no disponible");
         }
@@ -136,18 +148,36 @@ private:
     }
 
     bool InitialiseControl() {
-        if (!ReloadProfiles()) {
-            store_.QuarantineInvalid();
+        const auto loadResult = ReloadProfiles();
+        if (loadResult != dfgt::agent::ProfileLoadResult::Loaded) {
+            if (loadResult == dfgt::agent::ProfileLoadResult::InvalidJson ||
+                loadResult == dfgt::agent::ProfileLoadResult::InvalidData) {
+                store_.QuarantineInvalid();
+            } else if (
+                loadResult != dfgt::agent::ProfileLoadResult::Missing) {
+                UpdateTray(
+                    L"DFGT Control · perfiles no disponibles; "
+                    L"fichero preservado");
+                return false;
+            }
             profiles_.push_back(
                 dfgt::agent::ProfileStore::DesktopProfile());
-            store_.Save(profiles_);
+            if (!store_.Save(profiles_)) {
+                UpdateTray(
+                    L"DFGT Control · no se pudieron crear los perfiles");
+                return false;
+            }
         }
         return ConnectDevice();
     }
 
-    bool ReloadProfiles() {
+    dfgt::agent::ProfileLoadResult ReloadProfiles() {
         std::vector<dfgt::agent::ProfileModel> loaded;
-        if (!store_.Load(loaded) || loaded.empty()) return false;
+        const auto result = store_.Load(loaded);
+        if (result != dfgt::agent::ProfileLoadResult::Loaded ||
+            loaded.empty()) {
+            return result;
+        }
         profiles_ = std::move(loaded);
         WIN32_FILE_ATTRIBUTE_DATA attributes{};
         if (GetFileAttributesExW(
@@ -156,16 +186,25 @@ private:
                 &attributes)) {
             profileWriteTime_ = attributes.ftLastWriteTime;
         }
-        return true;
+        return dfgt::agent::ProfileLoadResult::Loaded;
     }
 
     bool ConnectDevice() {
-        if (FAILED(EnsureBroker())) return false;
+        if (GetTickCount64() < nextAttachAttempt_) return false;
         const auto path = dfgt::agent::FindDfgtDevicePath();
-        if (!path || FAILED(control_.AttachDevice(*path))) {
+        if (!path) {
             UpdateTray(L"DFGT Control · volante desconectado");
+            nextAttachAttempt_ = GetTickCount64() + 2000;
             return true;
         }
+        if (FAILED(EnsureBroker())) return false;
+        if (FAILED(control_.AttachDevice(*path))) {
+            UpdateTray(L"DFGT Control · error al conectar volante");
+            nextAttachAttempt_ = GetTickCount64() + 2000;
+            return true;
+        }
+        nextAttachAttempt_ = 0;
+        brokerBackoffMs_ = 500;
         ApplyProfile(profiles_.front());
         return true;
     }
@@ -179,7 +218,8 @@ private:
             CompareFileTime(
                 &attributes.ftLastWriteTime,
                 &profileWriteTime_) != 0 &&
-            ReloadProfiles()) {
+            ReloadProfiles() ==
+                dfgt::agent::ProfileLoadResult::Loaded) {
             activeProfile_.clear();
             ApplyForegroundProfile();
         }
@@ -189,12 +229,48 @@ private:
             control_.Close();
             activeProfile_.clear();
             ConnectDevice();
+        } else if (
+            dfgt::agent::ShouldDetachMissingNativeDevice(
+                status.connected != 0,
+                dfgt::agent::FindDfgtDevicePath().has_value())) {
+            control_.DetachDevice();
+            activeProfile_.clear();
+            nextAttachAttempt_ = GetTickCount64() + 2000;
+            UpdateTray(L"DFGT Control · volante desconectado");
+            return;
+        } else if (dfgt::agent::RequiresReconnect(status.state)) {
+            activeProfile_.clear();
+            ConnectDevice();
+        } else if (
+            status.safetyMode ==
+                static_cast<std::uint32_t>(
+                    dfgt::ipc::SafetyMode::EmergencyLatched)) {
+            UpdateTray(L"DFGT Control · PARADA ENCLAVADA");
+        } else if (
+            status.safetyMode ==
+                static_cast<std::uint32_t>(
+                    dfgt::ipc::SafetyMode::StopUnconfirmed)) {
+            UpdateTray(
+                L"DFGT Control · PARADA NO CONFIRMADA: "
+                L"DESCONECTA EL VOLANTE");
+        }
+        if (hook_ == nullptr) {
+            ApplyForegroundProfile();
         }
     }
 
     HRESULT EnsureBroker() {
         auto result = control_.Connect();
-        if (SUCCEEDED(result)) return result;
+        if (SUCCEEDED(result)) {
+            brokerBackoffMs_ = 500;
+            nextBrokerAttempt_ = 0;
+            return result;
+        }
+        const auto now = GetTickCount64();
+        if (now < nextBrokerAttempt_) return result;
+        nextBrokerAttempt_ = now + brokerBackoffMs_;
+        brokerBackoffMs_ =
+            dfgt::agent::NextBrokerBackoff(brokerBackoffMs_);
         const auto broker =
             ModuleDirectory() + L"\\DfgtFfbBroker.exe";
         STARTUPINFOW startup{};
@@ -220,7 +296,11 @@ private:
         do {
             Sleep(100);
             result = control_.Connect();
-            if (SUCCEEDED(result)) return result;
+            if (SUCCEEDED(result)) {
+                brokerBackoffMs_ = 500;
+                nextBrokerAttempt_ = 0;
+                return result;
+            }
         } while (GetTickCount64() < deadline);
         return result;
     }
@@ -282,6 +362,11 @@ private:
             MF_STRING,
             kMenuEmergencyStop,
             L"Parada de emergencia");
+        AppendMenuW(
+            menu,
+            MF_STRING,
+            kMenuRearm,
+            L"Confirmar y rearmar");
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(menu, MF_STRING, kMenuExit, L"Salir");
         SetForegroundWindow(window_);
@@ -304,7 +389,121 @@ private:
         Shell_NotifyIconW(NIM_MODIFY, &tray_);
     }
 
+    void RegisterForDeviceChanges() {
+        GUID hidGuid{};
+        HidD_GetHidGuid(&hidGuid);
+        DEV_BROADCAST_DEVICEINTERFACE_W filter{};
+        filter.dbcc_size = sizeof(filter);
+        filter.dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE;
+        filter.dbcc_classguid = hidGuid;
+        deviceNotification_ = RegisterDeviceNotificationW(
+            window_,
+            &filter,
+            DEVICE_NOTIFY_WINDOW_HANDLE);
+    }
+
+    struct UiBridgeCall final {
+        dfgt::agentui::Command command{};
+        dfgt::ipc::control::Status status{};
+        HRESULT result{E_FAIL};
+    };
+
+    void RunUiServer(std::stop_token stop) {
+        while (!stop.stop_requested()) {
+            const auto pipe = CreateNamedPipeW(
+                dfgt::agentui::PipeName,
+                PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE |
+                    FILE_FLAG_OVERLAPPED,
+                PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT |
+                    PIPE_REJECT_REMOTE_CLIENTS,
+                1,
+                sizeof(dfgt::agentui::Response),
+                sizeof(dfgt::agentui::Request),
+                0,
+                nullptr);
+            if (pipe == INVALID_HANDLE_VALUE) return;
+            const auto connected = dfgt::io::ConnectPipe(pipe, 500);
+            if (FAILED(connected)) {
+                CloseHandle(pipe);
+                continue;
+            }
+            ULONG clientPid = 0;
+            dfgt::agentui::Request request{};
+            if (GetNamedPipeClientProcessId(pipe, &clientPid) &&
+                clientPid != 0 &&
+                dfgt::ipc::SameUserToken(clientPid)) {
+                const auto read = dfgt::io::ReadExact(
+                    pipe, &request, sizeof(request), 500);
+                if (read.Succeeded(sizeof(request)) &&
+                    request.magic == dfgt::agentui::Magic &&
+                    request.version == dfgt::agentui::Version &&
+                    request.size == sizeof(request) &&
+                    request.command >=
+                        dfgt::agentui::Command::GetStatus &&
+                    request.command <=
+                        dfgt::agentui::Command::PrepareForMaintenance) {
+                    UiBridgeCall call{};
+                    call.command = request.command;
+                    DWORD_PTR messageResult = 0;
+                    const auto delivered = SendMessageTimeoutW(
+                        window_,
+                        kUiBridgeRequest,
+                        0,
+                        reinterpret_cast<LPARAM>(&call),
+                        SMTO_ABORTIFHUNG | SMTO_BLOCK,
+                        500,
+                        &messageResult);
+                    if (delivered == 0) call.result =
+                        HRESULT_FROM_WIN32(GetLastError());
+                    dfgt::agentui::Response response{};
+                    response.sequence = request.sequence;
+                    response.result = call.result;
+                    response.deviceState =
+                        static_cast<std::uint32_t>(
+                            call.status.state);
+                    response.connected = call.status.connected;
+                    response.ffbClientConnected =
+                        call.status.ffbClientConnected;
+                    response.safetyMode = call.status.safetyMode;
+                    response.activeSlots = call.status.activeSlots;
+                    response.stopConfirmed =
+                        call.status.stopConfirmed;
+                    response.lastSafetyError =
+                        call.status.lastSafetyError;
+                    response.safetyGeneration =
+                        call.status.safetyGeneration;
+                    wcsncpy_s(
+                        response.activeProfileId,
+                        call.status.activeProfileId,
+                        _TRUNCATE);
+                    const auto wrote = dfgt::io::WriteExact(
+                        pipe, &response, sizeof(response), 500);
+                    if (wrote.Succeeded(sizeof(response))) {
+                        std::uint32_t acknowledgement = 0;
+                        const auto ack = dfgt::io::ReadExact(
+                            pipe,
+                            &acknowledgement,
+                            sizeof(acknowledgement),
+                            500);
+                        const auto acknowledged =
+                            ack.Succeeded(sizeof(acknowledgement)) &&
+                            acknowledgement == request.sequence;
+                        (void)acknowledged;
+                    }
+                }
+            }
+            DisconnectNamedPipe(pipe);
+            CloseHandle(pipe);
+        }
+    }
+
     void Shutdown() {
+        uiServer_.request_stop();
+        if (uiServer_.joinable()) uiServer_.join();
+        if (deviceNotification_ != nullptr) {
+            UnregisterDeviceNotification(deviceNotification_);
+            deviceNotification_ = nullptr;
+        }
         if (hook_ != nullptr) UnhookWinEvent(hook_);
         control_.DetachDevice();
         control_.Close();
@@ -318,6 +517,64 @@ private:
         WPARAM wParam,
         LPARAM lParam) {
         switch (message) {
+        case kUiBridgeRequest: {
+            auto* call = reinterpret_cast<UiBridgeCall*>(lParam);
+            if (call == nullptr) return 0;
+            if (call->command ==
+                dfgt::agentui::Command::EmergencyStop) {
+                call->result = control_.EmergencyStop();
+            } else if (
+                call->command ==
+                dfgt::agentui::Command::AcknowledgeAndRearm) {
+                call->result = control_.AcknowledgeAndRearm();
+            } else if (
+                call->command ==
+                dfgt::agentui::Command::PrepareForMaintenance) {
+                call->result = control_.PrepareForMaintenance();
+            } else {
+                call->result = control_.GetStatus(call->status);
+                return 0;
+            }
+            const auto statusResult =
+                control_.GetStatus(call->status);
+            if (SUCCEEDED(call->result) &&
+                FAILED(statusResult)) {
+                call->result = statusResult;
+            }
+            return 0;
+        }
+        case WM_DEVICECHANGE:
+            if (wParam == DBT_DEVICEREMOVECOMPLETE) {
+                control_.DetachDevice();
+                activeProfile_.clear();
+                nextAttachAttempt_ = GetTickCount64() + 2000;
+                UpdateTray(L"DFGT Control · volante desconectado");
+            } else if (wParam == DBT_DEVICEARRIVAL) {
+                nextAttachAttempt_ = 0;
+                activeProfile_.clear();
+                ConnectDevice();
+            }
+            return TRUE;
+        case WM_POWERBROADCAST:
+            if (wParam == PBT_APMSUSPEND) {
+                control_.DetachDevice();
+                activeProfile_.clear();
+            } else if (
+                wParam == PBT_APMRESUMEAUTOMATIC ||
+                wParam == PBT_APMRESUMESUSPEND) {
+                nextAttachAttempt_ = 0;
+                ConnectDevice();
+            }
+            return TRUE;
+        case WM_QUERYENDSESSION:
+            control_.DetachDevice();
+            return TRUE;
+        case WM_ENDSESSION:
+            if (wParam != FALSE) {
+                control_.DetachDevice();
+                control_.Close();
+            }
+            return 0;
         case kTrayMessage:
             if (LOWORD(lParam) == WM_LBUTTONDBLCLK) {
                 OpenUserInterface();
@@ -347,8 +604,29 @@ private:
                 OpenUserInterface();
                 break;
             case kMenuEmergencyStop:
-                control_.EmergencyStop();
-                UpdateTray(L"DFGT Control · fuerza detenida");
+                if (SUCCEEDED(control_.EmergencyStop())) {
+                    UpdateTray(
+                        L"DFGT Control · PARADA ENCLAVADA");
+                } else {
+                    UpdateTray(
+                        L"DFGT Control · PARADA NO CONFIRMADA: "
+                        L"DESCONECTA EL VOLANTE");
+                }
+                break;
+            case kMenuRearm:
+                if (MessageBoxW(
+                        window_,
+                        L"Confirma que el volante está libre y que deseas "
+                        L"rearmar el force feedback.",
+                        L"Rearmar DFGT",
+                        MB_ICONWARNING | MB_OKCANCEL |
+                            MB_DEFBUTTON2) == IDOK) {
+                    const auto result =
+                        control_.AcknowledgeAndRearm();
+                    UpdateTray(SUCCEEDED(result)
+                        ? L"DFGT Control · rearmado"
+                        : L"DFGT Control · rearme rechazado");
+                }
                 break;
             case kMenuExit:
                 PostQuitMessage(0);
@@ -423,21 +701,26 @@ private:
     HINSTANCE instance_{nullptr};
     HWND window_{nullptr};
     HWINEVENTHOOK hook_{nullptr};
+    HDEVNOTIFY deviceNotification_{nullptr};
     NOTIFYICONDATAW tray_{};
     dfgt::agent::ControlClient control_;
     dfgt::agent::ProfileStore store_;
     std::vector<dfgt::agent::ProfileModel> profiles_;
     std::wstring activeProfile_;
     FILETIME profileWriteTime_{};
+    ULONGLONG nextBrokerAttempt_{};
+    ULONGLONG nextAttachAttempt_{};
+    DWORD brokerBackoffMs_{500};
+    std::jthread uiServer_;
 };
 
 } // namespace
 
 int WINAPI wWinMain(
-    HINSTANCE instance,
-    HINSTANCE,
-    PWSTR,
-    int) {
+    _In_ HINSTANCE instance,
+    _In_opt_ HINSTANCE,
+    _In_ PWSTR,
+    _In_ int) {
     const auto mutex = CreateMutexW(
         nullptr,
         TRUE,

@@ -1,0 +1,51 @@
+{
+  "cases": [
+    {
+      "name": "valid",
+      "valid": true,
+      "document": {
+        "schemaVersion": 1,
+        "revision": 3,
+        "profiles": [
+          { "id": "desktop", "name": "Desktop", "executablePath": "", "rangeDegrees": 900, "overallGain": 10000, "boundaryForce": 3000, "springGain": 10000, "damperGain": 10000, "frictionGain": 10000, "periodicGain": 10000 },
+          { "id": "game-a", "name": "Game A", "executablePath": "C:\\Games\\A.exe", "rangeDegrees": 540, "overallGain": 8000, "boundaryForce": 2500, "springGain": 7000, "damperGain": 6000, "frictionGain": 5000, "periodicGain": 9000 }
+        ]
+      }
+    },
+    {
+      "name": "duplicate-id-case-insensitive",
+      "valid": false,
+      "document": {
+        "schemaVersion": 1,
+        "revision": 0,
+        "profiles": [
+          { "id": "desktop", "name": "Desktop", "executablePath": "", "rangeDegrees": 900, "overallGain": 10000, "boundaryForce": 3000, "springGain": 10000, "damperGain": 10000, "frictionGain": 10000, "periodicGain": 10000 },
+          { "id": "DESKTOP", "name": "Duplicate", "executablePath": "", "rangeDegrees": 900, "overallGain": 10000, "boundaryForce": 3000, "springGain": 10000, "damperGain": 10000, "frictionGain": 10000, "periodicGain": 10000 }
+        ]
+      }
+    },
+    {
+      "name": "relative-executable",
+      "valid": false,
+      "document": {
+        "schemaVersion": 1,
+        "revision": 0,
+        "profiles": [
+          { "id": "desktop", "name": "Desktop", "executablePath": "", "rangeDegrees": 900, "overallGain": 10000, "boundaryForce": 3000, "springGain": 10000, "damperGain": 10000, "frictionGain": 10000, "periodicGain": 10000 },
+          { "id": "game-b", "name": "Game B", "executablePath": "Games\\B.exe", "rangeDegrees": 540, "overallGain": 8000, "boundaryForce": 2500, "springGain": 7000, "damperGain": 6000, "frictionGain": 5000, "periodicGain": 9000 }
+        ]
+      }
+    },
+    {
+      "name": "gain-out-of-range",
+      "valid": false,
+      "document": {
+        "schemaVersion": 1,
+        "revision": 0,
+        "profiles": [
+          { "id": "desktop", "name": "Desktop", "executablePath": "", "rangeDegrees": 900, "overallGain": 10001, "boundaryForce": 3000, "springGain": 10000, "damperGain": 10000, "frictionGain": 10000, "periodicGain": 10000 }
+        ]
+      }
+    }
+  ]
+}

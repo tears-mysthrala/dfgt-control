@@ -6,6 +6,8 @@
 #include <string>
 
 #include "../shared/BrokerProtocol.h"
+#include "../shared/BoundedIo.h"
+#include "../shared/WireCodec.h"
 
 namespace {
 
@@ -14,11 +16,13 @@ HRESULT Send(
     dfgt::ipc::Command command,
     std::uint32_t sequence,
     std::int32_t value = 0,
-    const wchar_t* path = nullptr) {
+    const wchar_t* path = nullptr,
+    std::uint64_t* nonce = nullptr) {
     dfgt::ipc::Message message{};
     message.command = command;
     message.sequence = sequence;
     message.value = value;
+    message.sessionNonce = nonce == nullptr ? 0 : *nonce;
     if (path != nullptr) {
         const auto length = wcsnlen(
             path,
@@ -27,32 +31,27 @@ HRESULT Send(
         std::copy_n(path, length + 1, message.devicePath);
     }
 
-    DWORD written = 0;
-    if (!WriteFile(
-            pipe,
-            &message,
-            sizeof(message),
-            &written,
-            nullptr) ||
-        written != sizeof(message)) {
-        return HRESULT_FROM_WIN32(GetLastError());
-    }
+    const auto encoded = dfgt::ipc::wire::Encode(message);
+    const auto write = dfgt::io::WriteExact(
+        pipe, encoded.data(),
+        static_cast<DWORD>(encoded.size()), 500);
+    if (!write.Succeeded(
+            static_cast<DWORD>(encoded.size()))) return write.result;
     dfgt::ipc::Response response{};
-    DWORD read = 0;
-    if (!ReadFile(
-            pipe,
-            &response,
-            sizeof(response),
-            &read,
-            nullptr) ||
-        read != sizeof(response)) {
-        return HRESULT_FROM_WIN32(GetLastError());
-    }
-    if (response.magic != dfgt::ipc::Magic ||
-        response.version != dfgt::ipc::Version ||
-        response.size != sizeof(response) ||
+    dfgt::ipc::wire::EncodedResponse encodedResponse{};
+    const auto read = dfgt::io::ReadExact(
+        pipe, encodedResponse.data(),
+        static_cast<DWORD>(encodedResponse.size()), 500);
+    if (!read.Succeeded(
+            static_cast<DWORD>(encodedResponse.size()))) return read.result;
+    if (!dfgt::ipc::wire::Decode(
+            encodedResponse, response) ||
         response.sequence != sequence) {
         return E_INVALIDARG;
+    }
+    if (nonce != nullptr) {
+        if (*nonce == 0) *nonce = response.sessionNonce;
+        else if (*nonce != response.sessionNonce) return E_ACCESSDENIED;
     }
     return response.result;
 }
@@ -78,16 +77,20 @@ int wmain(int argc, wchar_t** argv) {
         0,
         nullptr,
         OPEN_EXISTING,
-        0,
+        FILE_FLAG_OVERLAPPED,
         nullptr);
     if (pipe == INVALID_HANDLE_VALUE) {
         std::wcerr << L"open pipe failed: " << GetLastError() << L"\n";
         return 4;
     }
 
-    auto result = Send(pipe, dfgt::ipc::Command::Open, 1, 0, argv[1]);
+    std::uint64_t nonce = 0;
+    auto result = Send(
+        pipe, dfgt::ipc::Command::Open, 1, 0, argv[1], &nonce);
     if (SUCCEEDED(result)) {
-        result = Send(pipe, dfgt::ipc::Command::SetRange, 2, degrees);
+        result = Send(
+            pipe, dfgt::ipc::Command::SetRange,
+            2, degrees, nullptr, &nonce);
     }
     if (SUCCEEDED(result)) {
         std::wcout
@@ -96,8 +99,12 @@ int wmain(int argc, wchar_t** argv) {
             << std::flush;
         Sleep(static_cast<DWORD>(seconds) * 1000);
     }
-    const auto restore = Send(pipe, dfgt::ipc::Command::SetRange, 3, 900);
-    const auto close = Send(pipe, dfgt::ipc::Command::Close, 4);
+    const auto restore = Send(
+        pipe, dfgt::ipc::Command::SetRange,
+        3, 900, nullptr, &nonce);
+    const auto close = Send(
+        pipe, dfgt::ipc::Command::Close,
+        4, 0, nullptr, &nonce);
     CloseHandle(pipe);
 
     std::wcout

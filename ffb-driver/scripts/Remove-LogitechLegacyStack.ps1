@@ -5,6 +5,9 @@ param(
 
     [string]$InstallRoot = (Join-Path $env:ProgramFiles 'DfgtControl'),
 
+    [Parameter(Mandatory)]
+    [string]$ExpectedVersion,
+
     [switch]$Execute
 )
 
@@ -35,7 +38,7 @@ if (-not (Test-Path $snapshotPath -PathType Leaf)) {
     throw "Backup snapshot is missing: $snapshotPath"
 }
 $snapshot = Get-Content $snapshotPath -Raw | ConvertFrom-Json
-if ($snapshot.schemaVersion -ne 2 -or
+if ($snapshot.schemaVersion -notin @(2, 3) -or
     $snapshot.dfgtHardwareId -ne 'VID_046D&PID_C29A') {
     throw 'Unsupported or mismatched backup snapshot.'
 }
@@ -112,7 +115,11 @@ if ($PSCmdlet.ShouldProcess(
     if ($LASTEXITCODE -ne 0) { throw 'PnP device rescan failed.' }
 
     & (Join-Path $PSScriptRoot 'Install-DfgtFfb.ps1') `
-        -InstallRoot $resolvedInstall -Confirm:$false
+        -InstallRoot $resolvedInstall `
+        -ExpectedVersion $ExpectedVersion `
+        -TargetUserSid ([string]$snapshot.accountSid) `
+        -TargetUserProfile ([string]$snapshot.userProfile) `
+        -Confirm:$false
     if ($LASTEXITCODE -ne 0) {
         throw 'Replacement registration repair failed.'
     }

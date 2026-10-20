@@ -14,7 +14,11 @@ system operation.
 ```powershell
 $backup = .\scripts\Backup-LogitechLegacyStack.ps1 |
   ConvertFrom-Json
-.\scripts\Install-DfgtFfb.ps1 -Confirm:$false
+.\scripts\Install-DfgtFfb.ps1 `
+  -ExpectedVersion '0.1.0-beta.1' `
+  -TargetUserSid $backup.accountSid `
+  -TargetUserProfile $backup.userProfile `
+  -Confirm:$false
 ```
 
 Test input and force feedback before removing anything.
@@ -31,6 +35,7 @@ DFGT is present and refuses to remove a package shared by another device.
 ```powershell
 .\scripts\Remove-LogitechLegacyStack.ps1 `
   -BackupDirectory $backup.backupDirectory `
+  -ExpectedVersion '0.1.0-beta.1' `
   -Execute `
   -Confirm:$false
 ```
@@ -51,7 +56,12 @@ administrator decision.
 After reboot:
 
 ```powershell
-.\scripts\Verify-HvciStack.ps1
+.\scripts\Verify-HvciStack.ps1 `
+  -ExpectedVersion '0.1.0-beta.1' `
+  -TargetUserSid $backup.accountSid `
+  -IncludeCodeIntegrityEvents `
+  -RunComSmoke `
+  -RunBrokerHandshake
 ```
 
 ## Rollback
@@ -59,10 +69,21 @@ After reboot:
 Uninstall only removes objects owned by the DFGT Control manifest:
 
 ```powershell
+# Disconnect the DFGT first.
 .\scripts\Uninstall-DfgtFfb.ps1 -Confirm:$false
 ```
 
-Registry backups and exported driver packages are stored under
-`%PROGRAMDATA%\DfgtControl\backups`. Restore only the exact backup created for
-the affected machine. Windows Update or a vendor installer may be safer than
-restoring an old package on a different Windows build.
+Legacy snapshots and exported driver packages are stored under
+`%PROGRAMDATA%\DfgtControl\legacy-backups`. Restore accepts only a schema 3
+snapshot whose machine GUID, user SID, hardware ID and file hashes match:
+
+```powershell
+.\scripts\Restore-LogitechLegacyStack.ps1 `
+  -BackupDirectory $backup.backupDirectory `
+  -Execute `
+  -Confirm:$false
+```
+
+The restore script reinstalls only the verified driver INFs with `pnputil`; it
+never imports arbitrary `.reg` files. Windows Update or a vendor installer may
+be safer than restoring an old package after a major Windows change.

@@ -50,17 +50,28 @@ Invoke-Checked cmake @(
     '-A', 'Win32')
 Invoke-Checked cmake @(
     '--build', (Join-Path $driver 'build-x86'),
-    '--config', 'Release',
-    '--target',
-    'DfgtDirectInputFfb',
-    'DfgtFfbComSmoke',
-    'DfgtProtocolTests')
+    '--config', 'Release')
 Invoke-Checked dotnet @(
     'publish', (Join-Path $driver 'ui\DfgtControl.csproj'),
     '-c', 'Release',
     '-r', 'win-x64',
-    '--self-contained', 'false',
+    '--self-contained', 'true',
     '-o', (Join-Path $driver 'ui\publish'))
+
+$publishedUi = Join-Path $driver 'ui\publish\DfgtControl.exe'
+$uiProcess = Start-Process -FilePath $publishedUi -PassThru
+try {
+    Start-Sleep -Seconds 2
+    if ($uiProcess.HasExited) {
+        throw "Published UI exited during launch smoke with code $($uiProcess.ExitCode)."
+    }
+}
+finally {
+    if (-not $uiProcess.HasExited) {
+        Stop-Process -Id $uiProcess.Id -Force
+        $uiProcess.WaitForExit()
+    }
+}
 
 if (-not $SkipTests) {
     Invoke-Checked ctest @(
@@ -91,7 +102,15 @@ $uiPublish = Join-Path $driver 'ui\publish'
 
 Copy-Item (Join-Path $release64 'DfgtDirectInputFfb.dll') `
     (Join-Path $stage 'bin\x64')
+Copy-Item (Join-Path $release64 'DfgtFfbComSmoke.exe') `
+    (Join-Path $stage 'bin\x64')
 Copy-Item (Join-Path $release64 'DfgtFfbBroker.exe') `
+    (Join-Path $stage 'bin\x64')
+Copy-Item (Join-Path $release64 'DfgtBrokerStatusSmoke.exe') `
+    (Join-Path $stage 'bin\x64')
+Copy-Item (Join-Path $release64 'DfgtMaintenance.exe') `
+    (Join-Path $stage 'bin\x64')
+Copy-Item (Join-Path $release64 'DfgtRestartManagerCheck.exe') `
     (Join-Path $stage 'bin\x64')
 Copy-Item (Join-Path $release64 'DfgtAgent.exe') `
     (Join-Path $stage 'bin\x64')
@@ -99,10 +118,13 @@ Copy-Item (Join-Path $uiPublish 'DfgtControl.exe') `
     (Join-Path $stage 'bin\x64')
 Copy-Item (Join-Path $release86 'DfgtDirectInputFfb.dll') `
     (Join-Path $stage 'bin\x86')
+Copy-Item (Join-Path $release86 'DfgtFfbComSmoke.exe') `
+    (Join-Path $stage 'bin\x86')
 $publicScripts = @(
     'Backup-LogitechLegacyStack.ps1',
     'Install-DfgtFfb.ps1',
     'Remove-LogitechLegacyStack.ps1',
+    'Restore-LogitechLegacyStack.ps1',
     'Uninstall-DfgtFfb.ps1',
     'Verify-HvciStack.ps1'
 )
@@ -117,8 +139,66 @@ Copy-Item -LiteralPath @(
 ) -Destination $stage
 Copy-Item -LiteralPath @(
     (Join-Path $root 'docs\MIGRATION.md'),
-    (Join-Path $root 'docs\ARCHITECTURE.md')
+    (Join-Path $root 'docs\ARCHITECTURE.md'),
+    (Join-Path $root 'docs\IPC-PROTOCOL.md'),
+    (Join-Path $root 'docs\SAFETY-STATE-MACHINE.md'),
+    (Join-Path $root 'docs\TEST-MATRIX.md'),
+    (Join-Path $root 'docs\MIGRATION-ROLLBACK.md'),
+    (Join-Path $root 'docs\VALIDATION.md'),
+    (Join-Path $root 'docs\FINAL-HARDENING-REPORT.md')
 ) -Destination (Join-Path $stage 'docs')
+
+$commitSha = (& git -C $root rev-parse HEAD).Trim()
+if ($LASTEXITCODE -ne 0 -or
+    $commitSha -notmatch '^[0-9a-f]{40}$') {
+    throw 'Could not resolve the source commit SHA.'
+}
+$commitTimestampText = (& git -C $root show -s --format=%cI HEAD).Trim()
+if ($LASTEXITCODE -ne 0) {
+    throw 'Could not resolve the source commit timestamp.'
+}
+$commitTimestamp = [DateTimeOffset]::Parse($commitTimestampText).UtcDateTime
+$sbom = [ordered]@{
+    spdxVersion = 'SPDX-2.3'
+    dataLicense = 'CC0-1.0'
+    SPDXID = 'SPDXRef-DOCUMENT'
+    name = "DfgtControl-$Version"
+    documentNamespace = "https://github.com/tears-mysthrala/dfgt-control/sbom/$commitSha"
+    creationInfo = [ordered]@{
+        created = $commitTimestamp.ToString('yyyy-MM-ddTHH:mm:ssZ')
+        creators = @('Tool: DfgtControl-Build-Release')
+    }
+    packages = @(
+        [ordered]@{
+            name = 'DfgtControl'
+            SPDXID = 'SPDXRef-Package-DfgtControl'
+            versionInfo = $Version
+            downloadLocation = 'NOASSERTION'
+            filesAnalyzed = $false
+            licenseConcluded = 'NOASSERTION'
+            licenseDeclared = 'MIT'
+            copyrightText = 'NOASSERTION'
+            externalRefs = @(
+                [ordered]@{
+                    referenceCategory = 'OTHER'
+                    referenceType = 'vcs'
+                    referenceLocator = "git+https://github.com/tears-mysthrala/dfgt-control.git@$commitSha"
+                }
+            )
+        }
+    )
+    relationships = @(
+        [ordered]@{
+            spdxElementId = 'SPDXRef-DOCUMENT'
+            relationshipType = 'DESCRIBES'
+            relatedSpdxElement = 'SPDXRef-Package-DfgtControl'
+        }
+    )
+}
+[IO.File]::WriteAllText(
+    (Join-Path $stage 'SBOM.spdx.json'),
+    ($sbom | ConvertTo-Json -Depth 8),
+    [Text.UTF8Encoding]::new($false))
 
 $manifestFiles = Get-ChildItem -LiteralPath $stage -File -Recurse |
     Sort-Object FullName |
@@ -131,7 +211,8 @@ $manifestFiles = Get-ChildItem -LiteralPath $stage -File -Recurse |
 $manifest = [ordered]@{
     schemaVersion = 1
     version = $Version
-    createdAtUtc = [DateTime]::UtcNow.ToString('o')
+    commitSha = $commitSha
+    createdAtUtc = $commitTimestamp.ToString('o')
     files = @($manifestFiles)
 }
 [IO.File]::WriteAllText(
@@ -139,6 +220,8 @@ $manifest = [ordered]@{
     ($manifest | ConvertTo-Json -Depth 5),
     [Text.UTF8Encoding]::new($false))
 
+Get-ChildItem -LiteralPath $stage -File -Recurse |
+    ForEach-Object { $_.LastWriteTimeUtc = $commitTimestamp }
 Compress-Archive -LiteralPath $stage -DestinationPath $zip `
     -CompressionLevel Optimal
 $hash = Get-FileHash -LiteralPath $zip -Algorithm SHA256
